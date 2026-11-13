@@ -44,11 +44,9 @@ class AIService:
         self.queue: asyncio.PriorityQueue[AIRequestTask] = asyncio.PriorityQueue(maxsize=100)
         self.semaphore = asyncio.Semaphore(2)
 
-        # وضعیت Circuit Breaker
         self.consecutive_failures = 0
         self.circuit_open_until: float = 0.0
 
-        # Cache محلی ساده با TTL (کلید -> (پاسخ، زمان انقضا))
         self._cache: dict[str, tuple[str, float]] = {}
         self._workers: list[asyncio.Task] = []
         self._running = False
@@ -83,6 +81,21 @@ class AIService:
             self._cache.clear()
         self._cache[key] = (val, time.time() + ttl_sec)
 
+    def _build_safety_settings(self) -> Optional[list[types.SafetySetting]]:
+        """تنظیم سطح فیلتر ایمنی جمنای بر اساس متغیر AI_ENABLE_SAFETY_FILTERS."""
+        if self.settings.AI_ENABLE_SAFETY_FILTERS:
+            return None
+        categories = [
+            types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        ]
+        return [
+            types.SafetySetting(category=cat, threshold=types.HarmBlockThreshold.BLOCK_NONE)
+            for cat in categories
+        ]
+
     async def generate_text(
         self,
         system_instruction: str,
@@ -100,12 +113,10 @@ class AIService:
             if cached:
                 return cached
 
-        # بررسی Circuit Breaker
         if time.time() < self.circuit_open_until:
             logger.warning("Circuit breaker is OPEN; returning fallback response.")
             return random.choice(fallbacks)
 
-        # بررسی سقف روزانه مصرف
         today = self._get_today_str()
         daily_count = await self.db.get_daily_api_count(today)
         if daily_count >= self.settings.DAILY_API_CALL_LIMIT:
@@ -125,7 +136,7 @@ class AIService:
 
         try:
             self.queue.put_nowait(task)
-            result = await asyncio.wait_for(task.future, timeout=25.0)
+            result = await asyncio.wait_for(task.future, timeout=45.0)
             return result
         except Exception as exc:
             logger.error(f"AI generation failed or timed out: {exc}")
@@ -154,9 +165,10 @@ class AIService:
                 self.queue.task_done()
 
     async def _call_gemini_with_retry(self, system_instruction: str, prompt: str) -> str:
-        """فراخوانی SDK رسمی google-genai با Exponential Backoff و مدیریت 429."""
+        """فراخوانی SDK رسمی google-genai با Exponential Backoff و مدیریت 429/503."""
         max_retries = 2
         base_delay = 2.0
+        safety_settings = self._build_safety_settings()
 
         for attempt in range(max_retries + 1):
             try:
@@ -164,6 +176,7 @@ class AIService:
                     system_instruction=system_instruction,
                     temperature=self.settings.AI_TEMPERATURE,
                     max_output_tokens=self.settings.AI_MAX_OUTPUT_TOKENS,
+                    safety_settings=safety_settings,
                 )
                 response = await asyncio.wait_for(
                     self.client.aio.models.generate_content(
@@ -171,7 +184,7 @@ class AIService:
                         contents=prompt,
                         config=config,
                     ),
-                    timeout=18.0,
+                    timeout=20.0,
                 )
                 text = (response.text or "").strip()
                 if not text:
@@ -186,13 +199,13 @@ class AIService:
                 err_str = str(exc)
                 self.consecutive_failures += 1
                 if self.consecutive_failures >= 5:
-                    self.circuit_open_until = time.time() + 180  # ۳ دقیقه توقف موقت
+                    self.circuit_open_until = time.time() + 180
                     logger.error("Circuit breaker tripped for 180s due to repeated API failures.")
 
                 if attempt < max_retries:
                     delay = base_delay * (2**attempt) + random.uniform(0.2, 1.0)
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        delay += 4.0
+                    if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        delay += 3.0
                     logger.warning(f"Gemini API error (attempt {attempt + 1}), retrying in {delay:.1f}s: {exc}")
                     await asyncio.sleep(delay)
                 else:
