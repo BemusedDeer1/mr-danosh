@@ -1,7 +1,9 @@
 import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -201,6 +203,50 @@ class DatabaseManager:
 
         return self._row_to_profile(row)
 
+    async def get_user_profile(self, user_id: int) -> Optional[UserProfile]:
+        assert self.conn is not None
+        cursor = await self.conn.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return self._row_to_profile(row) if row else None
+
+    async def save_user_profile(self, profile: UserProfile) -> None:
+        assert self.conn is not None
+        now = now_iso(self.timezone)
+        await self.conn.execute(
+            """
+            UPDATE user_profiles SET
+                full_name = ?,
+                username = ?,
+                interests_json = ?,
+                humor_style = ?,
+                comm_style = ?,
+                relationships_json = ?,
+                inside_jokes_json = ?,
+                persona_summary = ?,
+                discipline_score = ?,
+                no_personal_jokes = ?,
+                opted_out = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                profile.full_name,
+                profile.username,
+                json.dumps([i.model_dump() for i in profile.interests], ensure_ascii=False),
+                profile.humor_style,
+                profile.comm_style,
+                json.dumps([r.model_dump() for r in profile.relationships], ensure_ascii=False),
+                json.dumps(profile.inside_jokes, ensure_ascii=False),
+                profile.persona_summary,
+                profile.discipline_score,
+                1 if profile.no_personal_jokes else 0,
+                1 if profile.opted_out else 0,
+                now,
+                profile.user_id,
+            ),
+        )
+        await self.conn.commit()
+
     async def increment_user_msg_count(self, user_id: int) -> int:
         assert self.conn is not None
         await self.conn.execute(
@@ -228,6 +274,23 @@ class DatabaseManager:
         )
         await self.conn.commit()
 
+    async def set_user_no_personal_jokes(self, user_id: int, disabled: bool) -> None:
+        assert self.conn is not None
+        val = 1 if disabled else 0
+        await self.conn.execute(
+            "UPDATE user_profiles SET no_personal_jokes = ?, updated_at = ? WHERE user_id = ?",
+            (val, now_iso(self.timezone), user_id),
+        )
+        await self.conn.commit()
+
+    async def get_top_active_users(self, limit: int = 10) -> list[UserProfile]:
+        assert self.conn is not None
+        cursor = await self.conn.execute(
+            "SELECT * FROM user_profiles WHERE opted_out = 0 ORDER BY msg_count DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_profile(r) for r in rows]
+
     def _row_to_profile(self, row: aiosqlite.Row) -> UserProfile:
         interests = [TraitItem(**i) for i in json.loads(row["interests_json"] or "[]")]
         relationships = [TraitItem(**r) for r in json.loads(row["relationships_json"] or "[]")]
@@ -251,6 +314,49 @@ class DatabaseManager:
             updated_at=row["updated_at"],
         )
 
+    # --- پیام‌های کوتاه‌مدت ---
+    async def save_short_term_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        user_id: int,
+        sender_name: str,
+        text: str,
+        reply_to_id: Optional[int],
+        created_at: str,
+    ) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            """
+            INSERT INTO short_term_messages (chat_id, message_id, user_id, sender_name, text, reply_to_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, message_id, user_id, sender_name, text, reply_to_id, created_at),
+        )
+        await self.conn.commit()
+
+    async def load_recent_short_term_messages(self, chat_id: int, limit: int = 40) -> list[dict]:
+        assert self.conn is not None
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM short_term_messages
+            WHERE chat_id = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (chat_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    async def cleanup_old_short_term_messages(self, ttl_hours: int = 24) -> int:
+        assert self.conn is not None
+        cutoff = (datetime.now(ZoneInfo(self.timezone)) - timedelta(hours=ttl_hours)).isoformat()
+        cursor = await self.conn.execute(
+            "DELETE FROM short_term_messages WHERE created_at < ?", (cutoff,)
+        )
+        await self.conn.commit()
+        return cursor.rowcount
+
     # --- خاطرات اپیزودیک و FTS5 ---
     async def add_episode(self, ep: EpisodeRecord) -> int:
         assert self.conn is not None
@@ -266,7 +372,9 @@ class DatabaseManager:
         await self.conn.commit()
         return cursor.lastrowid or 0
 
-    async def search_episodes_fts(self, chat_id: int, query_text: str, limit: int = 3) -> list[EpisodeRecord]:
+    async def search_episodes_fts(
+        self, chat_id: int, query_text: str, user_id: Optional[int] = None, limit: int = 3
+    ) -> list[EpisodeRecord]:
         assert self.conn is not None
         norm_q = normalize_persian(query_text)
         tokens = [t for t in norm_q.split() if len(t) >= 2]
@@ -282,26 +390,86 @@ class DatabaseManager:
                 ORDER BY e.importance DESC, e.id DESC
                 LIMIT ?
                 """,
-                (chat_id, fts_query, limit),
+                (chat_id, fts_query, limit * 2),
             )
             rows = await cursor.fetchall()
-            return [
-                EpisodeRecord(
+            results: list[EpisodeRecord] = []
+            for r in rows:
+                u_ids = json.loads(r["user_ids_json"] or "[]")
+                ep = EpisodeRecord(
                     id=r["id"],
                     chat_id=r["chat_id"],
                     summary=r["summary"],
                     event_date=r["event_date"],
-                    user_ids=json.loads(r["user_ids_json"] or "[]"),
+                    user_ids=u_ids,
                     tags=r["tags"],
                     importance=r["importance"],
                     last_recalled_at=r["last_recalled_at"],
                     recall_count=r["recall_count"],
                 )
-                for r in rows
-            ]
+                results.append(ep)
+
+            # اولویت‌دهی به خاطراتی که کاربر فعلی در آن‌ها حضور داشته است
+            if user_id is not None:
+                results.sort(key=lambda x: (user_id in x.user_ids, x.importance, x.id or 0), reverse=True)
+            return results[:limit]
         except Exception as exc:
             logger.warning(f"FTS search warning: {exc}")
             return []
+
+    async def get_user_episodes(self, chat_id: int, user_id: int, limit: int = 10) -> list[EpisodeRecord]:
+        assert self.conn is not None
+        cursor = await self.conn.execute(
+            "SELECT * FROM episodes WHERE chat_id = ? ORDER BY id DESC LIMIT 100", (chat_id,)
+        )
+        rows = await cursor.fetchall()
+        matched: list[EpisodeRecord] = []
+        for r in rows:
+            u_ids = json.loads(r["user_ids_json"] or "[]")
+            if user_id in u_ids:
+                matched.append(
+                    EpisodeRecord(
+                        id=r["id"],
+                        chat_id=r["chat_id"],
+                        summary=r["summary"],
+                        event_date=r["event_date"],
+                        user_ids=u_ids,
+                        tags=r["tags"],
+                        importance=r["importance"],
+                    )
+                )
+                if len(matched) >= limit:
+                    break
+        return matched
+
+    async def mark_episodes_recalled(self, episode_ids: list[int]) -> None:
+        assert self.conn is not None
+        if not episode_ids:
+            return
+        now = now_iso(self.timezone)
+        for eid in episode_ids:
+            await self.conn.execute(
+                "UPDATE episodes SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?",
+                (now, eid),
+            )
+        await self.conn.commit()
+
+    async def prune_old_episodes(self, max_keep: int = 300) -> int:
+        """حذف خاطرات قدیمی و کم‌اهمیت برای جلوگیری از رشد بی‌رویه دیتابیس."""
+        assert self.conn is not None
+        cursor = await self.conn.execute(
+            """
+            DELETE FROM episodes
+            WHERE id NOT IN (
+                SELECT id FROM episodes
+                ORDER BY importance DESC, recall_count DESC, id DESC
+                LIMIT ?
+            )
+            """,
+            (max_keep,),
+        )
+        await self.conn.commit()
+        return cursor.rowcount
 
     # --- آمار مصرف API ---
     async def log_api_usage(self, date_str: str, est_tokens: int) -> None:
@@ -325,3 +493,19 @@ class DatabaseManager:
         )
         row = await cursor.fetchone()
         return int(row["request_count"]) if row else 0
+
+    async def get_total_stats(self) -> dict:
+        assert self.conn is not None
+        u_cur = await self.conn.execute("SELECT COUNT(*) as c, COALESCE(SUM(msg_count), 0) as m FROM user_profiles")
+        u_row = await u_cur.fetchone()
+        e_cur = await self.conn.execute("SELECT COUNT(*) as c FROM episodes")
+        e_row = await e_cur.fetchone()
+        a_cur = await self.conn.execute("SELECT COALESCE(SUM(request_count), 0) as r, COALESCE(SUM(est_tokens), 0) as t FROM api_usage")
+        a_row = await a_cur.fetchone()
+        return {
+            "users_count": u_row["c"] if u_row else 0,
+            "total_messages": u_row["m"] if u_row else 0,
+            "episodes_count": e_row["c"] if e_row else 0,
+            "api_requests": a_row["r"] if a_row else 0,
+            "est_tokens": a_row["t"] if a_row else 0,
+        }
