@@ -283,6 +283,23 @@ class DatabaseManager:
         )
         await self.conn.commit()
 
+    async def adjust_discipline_score(self, user_id: int, delta: int) -> int:
+        """تغییر نمره انضباطی طنز کاربر در بازه ۰ تا ۱۰۰."""
+        assert self.conn is not None
+        cursor = await self.conn.execute(
+            "SELECT discipline_score FROM user_profiles WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return 100
+        new_score = max(0, min(100, int(row["discipline_score"]) + delta))
+        await self.conn.execute(
+            "UPDATE user_profiles SET discipline_score = ?, updated_at = ? WHERE user_id = ?",
+            (new_score, now_iso(self.timezone), user_id),
+        )
+        await self.conn.commit()
+        return new_score
+
     async def get_top_active_users(self, limit: int = 10) -> list[UserProfile]:
         assert self.conn is not None
         cursor = await self.conn.execute(
@@ -409,7 +426,6 @@ class DatabaseManager:
                 )
                 results.append(ep)
 
-            # اولویت‌دهی به خاطراتی که کاربر فعلی در آن‌ها حضور داشته است
             if user_id is not None:
                 results.sort(key=lambda x: (user_id in x.user_ids, x.importance, x.id or 0), reverse=True)
             return results[:limit]
@@ -442,6 +458,12 @@ class DatabaseManager:
                     break
         return matched
 
+    async def delete_episode(self, episode_id: int) -> bool:
+        assert self.conn is not None
+        cursor = await self.conn.execute("DELETE FROM episodes WHERE id = ?", (episode_id,))
+        await self.conn.commit()
+        return cursor.rowcount > 0
+
     async def mark_episodes_recalled(self, episode_ids: list[int]) -> None:
         assert self.conn is not None
         if not episode_ids:
@@ -470,6 +492,70 @@ class DatabaseManager:
         )
         await self.conn.commit()
         return cursor.rowcount
+
+    # --- شوخی‌های داخلی (Inside Jokes) ---
+    async def track_inside_joke_candidate(
+        self, chat_id: int, phrase: str, user_id: int, threshold: int = 3
+    ) -> Optional[str]:
+        """ثبت عبارت پرتکرار؛ اگر به حد نصاب (حداقل ۳ بار توسط حداقل ۲ نفر) برسد، عنوان را برمی‌گرداند."""
+        assert self.conn is not None
+        norm = normalize_persian(phrase).lower()
+        if len(norm) < 4 or len(norm) > 60:
+            return None
+
+        cursor = await self.conn.execute(
+            "SELECT * FROM inside_jokes WHERE chat_id = ? AND normalized_phrase = ?",
+            (chat_id, norm),
+        )
+        row = await cursor.fetchone()
+        now = now_iso(self.timezone)
+
+        if not row:
+            await self.conn.execute(
+                """
+                INSERT INTO inside_jokes (chat_id, phrase, normalized_phrase, mention_count, user_ids_json, created_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (chat_id, phrase.strip(), norm, json.dumps([user_id]), now),
+            )
+            await self.conn.commit()
+            return None
+
+        u_ids: list[int] = json.loads(row["user_ids_json"] or "[]")
+        if user_id not in u_ids:
+            u_ids.append(user_id)
+        new_count = int(row["mention_count"]) + 1
+        was_confirmed = bool(row["is_confirmed"])
+        now_confirmed = was_confirmed or (new_count >= threshold and len(u_ids) >= 2)
+
+        await self.conn.execute(
+            """
+            UPDATE inside_jokes
+            SET mention_count = ?, user_ids_json = ?, is_confirmed = ?
+            WHERE id = ?
+            """,
+            (new_count, json.dumps(u_ids), 1 if now_confirmed else 0, row["id"]),
+        )
+        await self.conn.commit()
+
+        if now_confirmed and not was_confirmed:
+            return row["phrase"]
+        return None
+
+    async def get_confirmed_inside_jokes(self, chat_id: int, limit: int = 10) -> list[dict]:
+        assert self.conn is not None
+        cursor = await self.conn.execute(
+            "SELECT * FROM inside_jokes WHERE chat_id = ? AND is_confirmed = 1 ORDER BY mention_count DESC LIMIT ?",
+            (chat_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def delete_inside_joke(self, joke_id: int) -> bool:
+        assert self.conn is not None
+        cursor = await self.conn.execute("DELETE FROM inside_jokes WHERE id = ?", (joke_id,))
+        await self.conn.commit()
+        return cursor.rowcount > 0
 
     # --- آمار مصرف API ---
     async def log_api_usage(self, date_str: str, est_tokens: int) -> None:
