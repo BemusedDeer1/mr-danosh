@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import httpx
 from google import genai
 from google.genai import types
 
@@ -28,7 +29,7 @@ class AIRequestTask:
 
 
 class AIService:
-    """مدیریت صف اولویت‌دار Gemini، Circuit Breaker، Cache و Fallback."""
+    """موتور ترکیبی Gemini + Groq با جابه‌جایی خودکار مدل، Circuit Breaker مجزا و Fallback."""
 
     CORE_FALLBACKS = [
         "ببین الان خط‌کشم افتاد زمین، حواسم پرت شد! دوباره بگو ببینم قضیه چیه؟",
@@ -37,15 +38,24 @@ class AIService:
         "اینا همش بازیه عزیزم، می‌خوان با همین بحث‌ها حواستون رو از درس و نظم پرت کنن!",
     ]
 
+    GEMINI_BACKUPS = [
+        "gemini-2.5-flash-lite",
+        "gemini-3.8-flash-lite",
+        "gemini-flash-latest",
+    ]
+
     def __init__(self, settings: Settings, db: DatabaseManager):
         self.settings = settings
         self.db = db
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self.http_client: Optional[httpx.AsyncClient] = None
+
         self.queue: asyncio.PriorityQueue[AIRequestTask] = asyncio.PriorityQueue(maxsize=100)
         self.semaphore = asyncio.Semaphore(2)
 
-        self.consecutive_failures = 0
-        self.circuit_open_until: float = 0.0
+        # Circuit Breaker مجزا برای جمنای تا در زمان شلوغی گوگل، بلافاصله برود سراغ Groq
+        self.gemini_failures = 0
+        self.gemini_open_until: float = 0.0
 
         self._cache: dict[str, tuple[str, float]] = {}
         self._workers: list[asyncio.Task] = []
@@ -53,14 +63,20 @@ class AIService:
 
     async def start(self) -> None:
         self._running = True
+        self.http_client = httpx.AsyncClient(timeout=20.0)
         self._workers = [asyncio.create_task(self._worker_loop(i)) for i in range(2)]
-        logger.info(f"AIService started with model '{self.settings.AI_MODEL}'.")
+        groq_status = f"enabled ({self.settings.GROQ_MODEL})" if self.settings.GROQ_API_KEY else "disabled"
+        logger.info(
+            f"AIService started | Primary Gemini: '{self.settings.AI_MODEL}' | Backup Groq: {groq_status}"
+        )
 
     async def stop(self) -> None:
         self._running = False
         for w in self._workers:
             w.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
+        if self.http_client:
+            await self.http_client.aclose()
         logger.info("AIService stopped.")
 
     def _get_today_str(self) -> str:
@@ -82,7 +98,6 @@ class AIService:
         self._cache[key] = (val, time.time() + ttl_sec)
 
     def _build_safety_settings(self) -> Optional[list[types.SafetySetting]]:
-        """تنظیم سطح فیلتر ایمنی جمنای بر اساس متغیر AI_ENABLE_SAFETY_FILTERS."""
         if self.settings.AI_ENABLE_SAFETY_FILTERS:
             return None
         categories = [
@@ -96,6 +111,14 @@ class AIService:
             for cat in categories
         ]
 
+    def _get_gemini_chain(self) -> list[str]:
+        chain = [self.settings.AI_MODEL]
+        for m in self.GEMINI_BACKUPS:
+            if m not in chain:
+                chain.append(m)
+        # حداکثر ۲ مدل جمنای را امتحان کن تا سریع به Groq برسیم و کاربر معطل نشود
+        return chain[:2]
+
     async def generate_text(
         self,
         system_instruction: str,
@@ -105,17 +128,12 @@ class AIService:
         cache_key: Optional[str] = None,
         fallback_pool: Optional[list[str]] = None,
     ) -> str:
-        """ارسال درخواست تولید متن به صف اولویت‌دار با بازگشت خودکار به Fallback در صورت خطا."""
         fallbacks = fallback_pool or self.CORE_FALLBACKS
 
         if use_cache and cache_key:
             cached = self._get_cached(cache_key)
             if cached:
                 return cached
-
-        if time.time() < self.circuit_open_until:
-            logger.warning("Circuit breaker is OPEN; returning fallback response.")
-            return random.choice(fallbacks)
 
         today = self._get_today_str()
         daily_count = await self.db.get_daily_api_count(today)
@@ -136,10 +154,10 @@ class AIService:
 
         try:
             self.queue.put_nowait(task)
-            result = await asyncio.wait_for(task.future, timeout=45.0)
+            result = await asyncio.wait_for(task.future, timeout=40.0)
             return result
         except Exception as exc:
-            logger.error(f"AI generation failed or timed out: {exc}")
+            logger.error(f"All AI providers failed or timed out: {exc}")
             return random.choice(fallbacks)
 
     async def _worker_loop(self, worker_id: int) -> None:
@@ -151,7 +169,7 @@ class AIService:
 
             try:
                 async with self.semaphore:
-                    response_text = await self._call_gemini_with_retry(
+                    response_text = await self._generate_with_failover(
                         task.system_instruction, task.prompt
                     )
                     if task.use_cache and task.cache_key and response_text:
@@ -164,13 +182,45 @@ class AIService:
             finally:
                 self.queue.task_done()
 
-    async def _call_gemini_with_retry(self, system_instruction: str, prompt: str) -> str:
-        """فراخوانی SDK رسمی google-genai با Exponential Backoff و مدیریت 429/503."""
-        max_retries = 2
-        base_delay = 2.0
-        safety_settings = self._build_safety_settings()
+    async def _generate_with_failover(self, system_instruction: str, prompt: str) -> str:
+        """تلاش با Gemini و در صورت شلوغی یا خطا، سوئیچ فوری روی Groq."""
+        gemini_err: Optional[Exception] = None
 
-        for attempt in range(max_retries + 1):
+        # ۱. تلاش با Gemini (اگر Circuit Breaker جمنای باز نباشد)
+        if time.time() >= self.gemini_open_until:
+            try:
+                text = await self._call_gemini_chain(system_instruction, prompt)
+                self.gemini_failures = 0
+                return text
+            except Exception as exc:
+                gemini_err = exc
+                self.gemini_failures += 1
+                if self.gemini_failures >= 4:
+                    self.gemini_open_until = time.time() + 180
+                    logger.warning("Gemini circuit breaker OPEN for 180s; routing directly to Groq.")
+        else:
+            logger.info("Gemini circuit is open; skipping straight to Groq.")
+
+        # ۲. سوئیچ فوری روی Groq در صورت وجود GROQ_API_KEY
+        if self.settings.GROQ_API_KEY:
+            try:
+                text = await self._call_groq(system_instruction, prompt)
+                logger.info(f"Successfully generated reply via Groq ({self.settings.GROQ_MODEL}).")
+                return text
+            except Exception as groq_exc:
+                logger.error(f"Groq backup also failed: {groq_exc}")
+                raise groq_exc
+
+        if gemini_err:
+            raise gemini_err
+        raise RuntimeError("No AI provider succeeded.")
+
+    async def _call_gemini_chain(self, system_instruction: str, prompt: str) -> str:
+        models_to_try = self._get_gemini_chain()
+        safety_settings = self._build_safety_settings()
+        last_exc: Optional[Exception] = None
+
+        for idx, model_name in enumerate(models_to_try):
             try:
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -180,34 +230,56 @@ class AIService:
                 )
                 response = await asyncio.wait_for(
                     self.client.aio.models.generate_content(
-                        model=self.settings.AI_MODEL,
+                        model=model_name,
                         contents=prompt,
                         config=config,
                     ),
-                    timeout=20.0,
+                    timeout=14.0,
                 )
                 text = (response.text or "").strip()
                 if not text:
-                    raise ValueError("Empty response received from Gemini.")
+                    raise ValueError(f"Empty response from Gemini '{model_name}'.")
 
-                self.consecutive_failures = 0
                 est_tokens = (len(system_instruction) + len(prompt) + len(text)) // 3
                 await self.db.log_api_usage(self._get_today_str(), est_tokens)
+                if idx > 0:
+                    logger.info(f"Recovered using backup Gemini model '{model_name}'.")
                 return text
-
             except Exception as exc:
-                err_str = str(exc)
-                self.consecutive_failures += 1
-                if self.consecutive_failures >= 5:
-                    self.circuit_open_until = time.time() + 180
-                    logger.error("Circuit breaker tripped for 180s due to repeated API failures.")
+                last_exc = exc
+                logger.warning(f"Gemini '{model_name}' failed: {str(exc)[:90]}")
+                if idx < len(models_to_try) - 1:
+                    await asyncio.sleep(0.8)
 
-                if attempt < max_retries:
-                    delay = base_delay * (2**attempt) + random.uniform(0.2, 1.0)
-                    if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        delay += 3.0
-                    logger.warning(f"Gemini API error (attempt {attempt + 1}), retrying in {delay:.1f}s: {exc}")
-                    await asyncio.sleep(delay)
-                else:
-                    raise
-        raise RuntimeError("Unreachable retry exit")
+        assert last_exc is not None
+        raise last_exc
+
+    async def _call_groq(self, system_instruction: str, prompt: str) -> str:
+        """فراخوانی Groq API (سازگار با استاندارد OpenAI) به عنوان موتور پشتیبان فوق‌سریع."""
+        assert self.http_client is not None
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.settings.GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.settings.GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.settings.AI_TEMPERATURE,
+            "max_tokens": self.settings.AI_MAX_OUTPUT_TOKENS,
+        }
+        resp = await self.http_client.post(url, headers=headers, json=payload)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:150]}")
+
+        data = resp.json()
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+        if not text:
+            raise ValueError("Empty response from Groq.")
+
+        est_tokens = (len(system_instruction) + len(prompt) + len(text)) // 3
+        await self.db.log_api_usage(self._get_today_str(), est_tokens)
+        return text
