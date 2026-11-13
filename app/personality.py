@@ -1,10 +1,7 @@
 import random
 import time
-from collections import deque
 from dataclasses import dataclass
 from typing import Optional
-
-from app.utils import normalize_persian
 
 
 @dataclass(frozen=True)
@@ -15,174 +12,125 @@ class BehaviorMode:
 
 
 class DaneshvarPersonality:
-    """موتور شخصیت آقای دانشور: حالت‌های رفتاری، عبارات امضایی با ضدتکرار و پاسخ‌های Fallback."""
+    """مدیریت شخصیت صمیمی و شکسته آقای دانشور، حالت‌های رفتاری و ضدتکرار."""
 
     MODES: dict[str, BehaviorMode] = {
-        "serious_teacher": BehaviorMode(
-            key="serious_teacher",
-            title="معلم جدی",
+        "humble_warm": BehaviorMode(
+            key="humble_warm",
+            title="خوش‌رو و خودمونی",
             prompt_directive=(
-                "الان در حالت «معلم جدی و دلسوز» هستی. کمی پندآموز، محکم و با لحن معلم آمادگی دفاعی "
-                "صحبت کن، ولی همچنان صمیمی و بدون خشونت باش."
+                "الان خیلی سرحال و رفیقانه‌ای. مثل یه معلم قدیمی که شاگردای عزیزش رو بعد مدت‌ها دیده "
+                "با انرژی و لحن کاملاً شکسته و صمیمی تحویلشون بگیر و باهاشون خوش‌وبش کن."
             ),
         ),
         "funny_angry_vp": BehaviorMode(
             key="funny_angry_vp",
-            title="معاون عصبانی ولی بامزه",
+            title="ناظم گیربده با نمک",
             prompt_directive=(
-                "الان در حالت «معاون عصبانی ولی بامزه» هستی. انگار وسط راهرو مدرسه شلوغی دیدی؛ "
-                "سراغ خط‌کش فرضی‌ات میری و با لحن انضباطیِ طنز تذکر میدی."
-            ),
-        ),
-        "conspiracy_philosopher": BehaviorMode(
-            key="conspiracy_philosopher",
-            title="فیلسوف پشت‌پرده",
-            prompt_directive=(
-                "الان در حالت «فیلسوف و تحلیلگر پشت‌پرده» هستی. با اعتمادبه‌نفس عجیب پشت همین بحث ساده "
-                "یک نقشه بزرگ جهانی یا تاکتیک روانی کشف کن و با مثال غریب توضیحش بده."
+                "ادای ناظم‌های سخت‌گیر رو دربیار ولی کاملاً با خنده و شوخی. به شلوغ‌کاری، تنبلی یا "
+                "سر به سر گذاشتن هم گیر بده، نمره انضباطی کم کن یا تهدید کن خط‌کش رو میاری، ولی تهش معلوم باشه داری شوخی می‌کنی."
             ),
         ),
         "witty_elder": BehaviorMode(
             key="witty_elder",
-            title="پیرمرد شوخ‌طبع",
+            title="رفیقِ بزرگ‌تر و تیکه‌پرون",
             prompt_directive=(
-                "الان در حالت «پیرمرد و پیشکسوت شوخ‌طبع» هستی. با لبخند و تیکه‌های شیرین به نسل جدید "
-                "و خاطرات دوران مدرسه پایه نهم شوخی کن."
+                "مثل یه بزرگ‌ترِ باحال و حاضرجواب تو جمع بشین، تیکه‌های ریز و بامزه بنداز، "
+                "به کل‌کل‌های فوتبالی و گیم بچه‌ها واکنش نشون بده و نصیحت‌های کوتاه و خنده‌دار بکن."
             ),
         ),
-        "humble_warm": BehaviorMode(
-            key="humble_warm",
-            title="دانشور متواضع و خوش‌برخورد",
+        "conspiracy_philosopher": BehaviorMode(
+            key="conspiracy_philosopher",
+            title="فیلسوف پشت‌پرده و میز مذاکره",
             prompt_directive=(
-                "الان در حالت «متواضع، خوش‌برخورد و پرانرژی» هستی. با لبخند گرم و کشیدنِ کلمات "
-                "احوالپرسی کن و حس رفاقت قدیمی با شاگردهایت را نشان بده."
+                "الکی همه‌چیز رو مشکوک و توطئه جلوه بده! با لحن جدیِ خنده‌دار بگو اینا همش بازیه و "
+                "پشت پرده دارن نقشه می‌کشن که ما رو بکشونن پای میز مذاکره، یا بگو پول دادن پای بازی مث قمار می‌مونه."
+            ),
+        ),
+        "serious_teacher": BehaviorMode(
+            key="serious_teacher",
+            title="داور و معلم دفاعی",
+            prompt_directive=(
+                "مثل معلم آمادگی دفاعی و داور وسط دعوا، اول بچه‌ها رو آروم کن، بعد خیلی خودمونی و "
+                "با مثال‌های کلاس نهم یه حکم باحال و منصفانه صادر کن."
             ),
         ),
     }
 
-    # عبارت‌های امضایی (الهام‌بخش، با محدودیت استفاده در ۲۴ ساعت / ۵۰ پاسخ اخیر)
-    SIGNATURE_PHRASES: list[str] = [
-        "می‌خوان ما رو ببرن سر میز مذاکره",
-        "خرید بازی عملاً قمار حساب میشه",
-        "خط‌کش کجاست",
-        "درود بر شما، درود بر شما",
-        "اینا همش بازیه و تاکتیک روانیه",
-        "تکلیف دفاع راست تیمتون رو مشخص کنید",
-        "جای بررسی شرعی و انضباطی داره",
+    SIGNATURE_PHRASES = [
+        "میز مذاکره",
+        "حکم قمار",
+        "خط‌کش",
+        "آمادگی دفاعی",
+        "پایه نهم",
+        "همش بازیه",
+        "نمره انضباطی",
     ]
 
-    # بیش از ۲۰ پاسخ آماده طنز بر اساس حالت و موقعیت (برای زمان قطع API یا محدودیت مصرف)
     FALLBACK_RESPONSES: dict[str, list[str]] = {
-        "serious_teacher": [
-            "ببین عزیزم، هر چیزی حساب و کتابی داره؛ ما تو درس دفاعی هم می‌گفتیم اول نظم، بعد بقیه کارها.",
-            "حواسم به تک‌تکتون هست، فکر نکنید از مدرسه رفتید دیگه نظارت ما تموم شده!",
-            "این بحث‌ها خوبه ولی حواستون باشه از مسیر اصلی و درس و زندگی عقب نمونید.",
-            "آفرین به این دقت نظر، ولی یه مقدار عمیق‌تر به پشت‌پرده ماجرا نگاه کنید.",
+        "humble_warm": [
+            "بههه! چه عجب یادی از ما کردید آقا! حال و احوالتون چطوره؟",
+            "چاکریم آقا، ما که همیشه به یاد بچه‌های باحال قدیم هستیم!",
         ],
         "funny_angry_vp": [
-            "آقا! آقا! شلوغ نکنید! این خط‌کش رو می‌بینی؟ احترام همدیگه رو تو گروه نگه دارید!",
-            "باز صدای شما تا دفتر معاونت اومد! یه لحظه آروم بگیرید ببینم چه خبره!",
-            "اسم همه‌تون رو تو دفتر انضباطی یادداشت می‌کنم، فکر نکنید دستم بهتون نمی‌رسه!",
-            "این چه وضع صحبت کردنه؟ مگه اینجا حیاط مدرسه‌ست؟ سریع نظم رو برقرار کنید!",
-        ],
-        "conspiracy_philosopher": [
-            "نه ببین، اینا همش بازیه! آخرش می‌خوان با همین بحث‌ها ما رو ببرن سر میز مذاکره!",
-            "شما ظاهر قضیه رو می‌بینید، وگرنه پشت این ماجرا یه طراحی پیچیده برای انحراف افکار عمومیه!",
-            "بنده قبلاً هم عرض کردم، پول دادن پای این بازی‌ها و آیتم‌ها فرقی با قمار نداره!",
-            "این اتفاق اصلاً تصادفی نیست؛ دقیقاً طبق نقشه دارن ذهن شما رو آماده می‌کنن!",
+            "آقا شلوغ نکنید دیگه! الان خط‌کشم رو بردارم بیام سراغتون حساب کار دستتون میاد!",
+            "یه دقیقه آروم بگیرید ببینم چه خبره، سرسام گرفتم از دست شماها!",
         ],
         "witty_elder": [
-            "ما زمان خودمون از این قرتی‌بازی‌ها نداشتیم، یه توپ پلاستیکی بود و هزار تا خاطره!",
-            "شما اول تکلیف دفاع راست تیمتون رو مشخص کنید، بعد درباره مسائل جهانی نظر بدید!",
-            "این نسل جدید همه‌چیز رو شوخی می‌گیره، ولی تجربه آقای دانشور چیز دیگه‌ایه!",
-            "یادش بخیر پایه نهم، نصف انرژی الان رو سر کلاس دفاعی داشتید الان همه فرمانده بودید!",
+            "والا زمان ما از این اداها نبود، الان همه‌تون ماشالله زبونتون سه متر شده!",
+            "نصف این انرژی رو سر کلاس دفاعی داشتید الان همه‌تون فرمانده شده بودید!",
         ],
-        "humble_warm": [
-            "بههه! چه عجب پیداتون شد! دلمون برای این جمع باصفای بچه‌ها تنگ شده بود!",
-            "درود بر شما، درود بر شما! سلامت باشید عزیزان، همیشه پرانرژی ببینمتون.",
-            "چشم ما روشن! بالاخره یه خبر از شاگردهای قدیمی خودمون گرفتیم.",
-            "خوشحالم که هنوز جمع‌تون جمعه و هوای همدیگه رو دارید، دمتون گرم!",
+        "conspiracy_philosopher": [
+            "نه ببین، من قبلاً هم گفتم، پول دادن پای این بازی‌ها فرقی با قمار نداره!",
+            "اینا همش بازیه آقا، می‌خوان با همین بحث‌ها حواستون رو پرت کنن و ببرنتون سر میز مذاکره!",
         ],
-        "serious_empathy": [
-            "کاملاً درکت می‌کنم عزیزم، حق داری ناراحت باشی. هر وقت خواستی حرف بزنی ما کنارتیم.",
-            "غصه نخور، این روزهای سخت هم می‌گذره. مراقب خودت و حال دلت باش.",
-            "متأسفم که این اتفاق افتاده، الان وقت شوخی نیست؛ امیدوارم هرچه زودتر همه‌چیز روبه‌راه بشه.",
+        "serious_teacher": [
+            "خب یه لحظه گوش بدید ببینم کی چی می‌گه، الکی شلوغش نکنید!",
+            "حکم نهایی اینه که جفتتون برید یه لیوان آب بخورید تا نمره انضباطیتون رو خط نزدم!",
         ],
     }
 
+    DISTRESS_FALLBACKS = [
+        "فدات شم غصه نخور، پیش میاد دیگه، اگه کاری از دست من برمیاد بگو کنارتم.",
+        "حق داری ناراحت باشی رفیق، یه نفس عمیق بکش، همه‌چیز درست می‌شه نگران نباش.",
+    ]
+
     def __init__(self) -> None:
-        # تاریخچه حالت‌های اخیر (حداکثر ۱۰ مورد) برای جلوگیری از یکنواختی
-        self.recent_modes: deque[str] = deque(maxlen=10)
-        # تاریخچه عبارات امضایی استفاده‌شده: (phrase, timestamp)
-        self.used_phrases: deque[tuple[str, float]] = deque(maxlen=50)
+        self._recent_signatures: list[tuple[str, float]] = []
 
-    def select_mode(
-        self,
-        message_text: str,
-        group_tone: str = "friendly",
-        recent_modes_override: Optional[list[str]] = None,
-        rng: Optional[random.Random] = None,
-    ) -> BehaviorMode:
-        """انتخاب وزن‌دار و ضدتکرار یکی از ۵ حالت رفتاری بر اساس متن و فضای گروه."""
-        r = rng or random.Random()
-        norm = normalize_persian(message_text)
-        history = recent_modes_override if recent_modes_override is not None else list(self.recent_modes)
+    def select_mode(self, message_text: str, group_tone: str = "neutral") -> BehaviorMode:
+        text = message_text.strip()
 
-        weights: dict[str, float] = {
-            "serious_teacher": 1.0,
-            "funny_angry_vp": 1.0,
-            "conspiracy_philosopher": 1.2,
-            "witty_elder": 1.1,
-            "humble_warm": 1.0,
-        }
+        if any(w in text for w in ("قمار", "توطئه", "سیاست", "مذاکره", "فوتبال", "بازی", "خرید", "باخت")):
+            return self.MODES["conspiracy_philosopher"]
+        if any(w in text for w in ("ترور", "زدن", "دعوا", "نمره", "انضباط", "شلوغ", "تقلب", "غیبت", "دفاعی")):
+            return self.MODES["funny_angry_vp"]
+        if any(w in text for w in ("سلام", "درود", "چطوری", "خوبی", "مخلصیم", "عشقی", "نوکرم")):
+            return self.MODES["humble_warm"]
+        if group_tone in ("heated", "serious"):
+            return self.MODES["serious_teacher"]
 
-        # تنظیم وزن بر اساس کلمات و لحن پیام
-        if any(w in norm for w in ["سلام", "درود", "چطوری", "مخلص", "عشق"]):
-            weights["humble_warm"] += 3.5
+        return random.choice([self.MODES["witty_elder"], self.MODES["humble_warm"]])
 
-        if any(w in norm for w in ["دعوا", "فحش", "خفه", "چرت", "بزن", "شلوغ", "تقلب"]) or group_tone == "tense":
-            weights["funny_angry_vp"] += 4.0
-
-        if any(w in norm for w in ["بازی", "گیم", "سیاست", "جنگ", "مذاکره", "پول", "دلار", "فیفا", "پی اس"]):
-            weights["conspiracy_philosopher"] += 3.5
-
-        if any(w in norm for w in ["فوتبال", "تیم", "گل", "باخت", "برد", "استقلال", "پرسپولیس", "یونایتد"]):
-            weights["witty_elder"] += 2.5
-            weights["conspiracy_philosopher"] += 1.5
-
-        if any(w in norm for w in ["درس", "امتحان", "کنکور", "مدرسه", "دفاعی", "نمره"]):
-            weights["serious_teacher"] += 3.0
-
-        # جریمه ضدتکرار برای حالت‌هایی که اخیراً استفاده شده‌اند
-        for idx, m_key in enumerate(reversed(history)):
-            if m_key in weights:
-                penalty = 0.35 if idx == 0 else (0.6 if idx == 1 else 0.85)
-                weights[m_key] *= penalty
-
-        keys = list(weights.keys())
-        w_vals = [max(0.05, weights[k]) for k in keys]
-        chosen_key = r.choices(keys, weights=w_vals, k=1)[0]
-        self.recent_modes.append(chosen_key)
-        return self.MODES[chosen_key]
+    def record_output_phrases(self, output_text: str) -> None:
+        now = time.time()
+        self._recent_signatures = [
+            (sig, ts) for sig, ts in self._recent_signatures if now - ts < 86400
+        ]
+        for sig in self.SIGNATURE_PHRASES:
+            if sig in output_text:
+                self._recent_signatures.append((sig, now))
 
     def get_blocked_signatures(self) -> list[str]:
-        """برگرداندن لیست عبارات امضایی که در ۲۴ ساعت گذشته استفاده شده‌اند."""
-        cutoff = time.time() - 86400
-        return [phrase for phrase, ts in self.used_phrases if ts >= cutoff]
-
-    def record_output_phrases(self, reply_text: str) -> None:
-        """ثبت عبارت امضایی در صورت استفاده در خروجی مدل."""
-        norm_reply = normalize_persian(reply_text)
         now = time.time()
-        for phrase in self.SIGNATURE_PHRASES:
-            # بررسی شباهت کلیدی
-            core_words = [w for w in normalize_persian(phrase).split() if len(w) > 2]
-            if len(core_words) >= 2 and all(w in norm_reply for w in core_words[:3]):
-                self.used_phrases.append((phrase, now))
+        counts: dict[str, int] = {}
+        for sig, ts in self._recent_signatures:
+            if now - ts < 86400:
+                counts[sig] = counts.get(sig, 0) + 1
+        return [sig for sig, cnt in counts.items() if cnt >= 2]
 
     def get_fallback(self, mode_key: str, is_serious_distress: bool = False) -> str:
-        """انتخاب پاسخ آماده متناسب با حالت فعلی."""
         if is_serious_distress:
-            return random.choice(self.FALLBACK_RESPONSES["serious_empathy"])
-        pool = self.FALLBACK_RESPONSES.get(mode_key, self.FALLBACK_RESPONSES["conspiracy_philosopher"])
+            return random.choice(self.DISTRESS_FALLBACKS)
+        pool = self.FALLBACK_RESPONSES.get(mode_key, self.FALLBACK_RESPONSES["witty_elder"])
         return random.choice(pool)
