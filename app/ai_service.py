@@ -29,7 +29,7 @@ class AIRequestTask:
 
 
 class AIService:
-    """موتور ترکیبی Gemini + Groq با جابه‌جایی خودکار مدل، Circuit Breaker مجزا و Fallback."""
+    """موتور ترکیبی Gemini + Groq با کشف خودکار مدل فعال، Circuit Breaker مجزا و Fallback."""
 
     CORE_FALLBACKS = [
         "ببین الان خط‌کشم افتاد زمین، حواسم پرت شد! دوباره بگو ببینم قضیه چیه؟",
@@ -39,8 +39,7 @@ class AIService:
     ]
 
     GEMINI_BACKUPS = [
-        "gemini-2.5-flash-lite",
-        "gemini-3.8-flash-lite",
+        "gemini-3.8-flash",
         "gemini-flash-latest",
     ]
 
@@ -53,9 +52,9 @@ class AIService:
         self.queue: asyncio.PriorityQueue[AIRequestTask] = asyncio.PriorityQueue(maxsize=100)
         self.semaphore = asyncio.Semaphore(2)
 
-        # Circuit Breaker مجزا برای جمنای تا در زمان شلوغی گوگل، بلافاصله برود سراغ Groq
         self.gemini_failures = 0
         self.gemini_open_until: float = 0.0
+        self._active_groq_model: str = settings.GROQ_MODEL
 
         self._cache: dict[str, tuple[str, float]] = {}
         self._workers: list[asyncio.Task] = []
@@ -65,7 +64,7 @@ class AIService:
         self._running = True
         self.http_client = httpx.AsyncClient(timeout=20.0)
         self._workers = [asyncio.create_task(self._worker_loop(i)) for i in range(2)]
-        groq_status = f"enabled ({self.settings.GROQ_MODEL})" if self.settings.GROQ_API_KEY else "disabled"
+        groq_status = f"enabled ({self._active_groq_model})" if self.settings.GROQ_API_KEY else "disabled"
         logger.info(
             f"AIService started | Primary Gemini: '{self.settings.AI_MODEL}' | Backup Groq: {groq_status}"
         )
@@ -116,7 +115,6 @@ class AIService:
         for m in self.GEMINI_BACKUPS:
             if m not in chain:
                 chain.append(m)
-        # حداکثر ۲ مدل جمنای را امتحان کن تا سریع به Groq برسیم و کاربر معطل نشود
         return chain[:2]
 
     async def generate_text(
@@ -186,7 +184,6 @@ class AIService:
         """تلاش با Gemini و در صورت شلوغی یا خطا، سوئیچ فوری روی Groq."""
         gemini_err: Optional[Exception] = None
 
-        # ۱. تلاش با Gemini (اگر Circuit Breaker جمنای باز نباشد)
         if time.time() >= self.gemini_open_until:
             try:
                 text = await self._call_gemini_chain(system_instruction, prompt)
@@ -201,11 +198,10 @@ class AIService:
         else:
             logger.info("Gemini circuit is open; skipping straight to Groq.")
 
-        # ۲. سوئیچ فوری روی Groq در صورت وجود GROQ_API_KEY
         if self.settings.GROQ_API_KEY:
             try:
                 text = await self._call_groq(system_instruction, prompt)
-                logger.info(f"Successfully generated reply via Groq ({self.settings.GROQ_MODEL}).")
+                logger.info(f"Successfully generated reply via Groq ({self._active_groq_model}).")
                 return text
             except Exception as groq_exc:
                 logger.error(f"Groq backup also failed: {groq_exc}")
@@ -254,32 +250,70 @@ class AIService:
         assert last_exc is not None
         raise last_exc
 
+    async def _discover_best_groq_model(self) -> Optional[str]:
+        """دریافت خودکار لیست مدل‌های فعال اکانت Groq در صورت منقضی شدن مدل پیش‌فرض."""
+        assert self.http_client is not None
+        url = "https://api.groq.com/openai/v1/models"
+        headers = {"Authorization": f"Bearer {self.settings.GROQ_API_KEY}"}
+        resp = await self.http_client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None
+
+        models_data = resp.json().get("data", [])
+        excluded_keywords = ("whisper", "guard", "tts", "embed", "vision", "orpheus")
+        candidates = [
+            m["id"]
+            for m in models_data
+            if m.get("id") and not any(bad in m["id"].lower() for bad in excluded_keywords)
+        ]
+        if not candidates:
+            return None
+
+        # اولویت‌بندی مدل‌های بزرگ و قوی برای زبان فارسی
+        for pref in ("70b", "qwen", "llama-4", "llama-3", "gemma", "8b"):
+            for cid in candidates:
+                if pref in cid.lower():
+                    return cid
+        return candidates[0]
+
     async def _call_groq(self, system_instruction: str, prompt: str) -> str:
-        """فراخوانی Groq API (سازگار با استاندارد OpenAI) به عنوان موتور پشتیبان فوق‌سریع."""
+        """فراخوانی Groq API با کشف خودکار مدل در صورت خطای 404."""
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.GROQ_API_KEY}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.settings.GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": self.settings.AI_TEMPERATURE,
-            "max_tokens": self.settings.AI_MAX_OUTPUT_TOKENS,
-        }
-        resp = await self.http_client.post(url, headers=headers, json=payload)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:150]}")
 
-        data = resp.json()
-        text = (data["choices"][0]["message"]["content"] or "").strip()
-        if not text:
-            raise ValueError("Empty response from Groq.")
+        for attempt in range(2):
+            payload = {
+                "model": self._active_groq_model,
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": self.settings.AI_TEMPERATURE,
+                "max_tokens": self.settings.AI_MAX_OUTPUT_TOKENS,
+            }
+            resp = await self.http_client.post(url, headers=headers, json=payload)
 
-        est_tokens = (len(system_instruction) + len(prompt) + len(text)) // 3
-        await self.db.log_api_usage(self._get_today_str(), est_tokens)
-        return text
+            if resp.status_code == 404 and attempt == 0:
+                discovered = await self._discover_best_groq_model()
+                if discovered and discovered != self._active_groq_model:
+                    logger.info(f"Groq model '{self._active_groq_model}' unavailable; auto-switched to '{discovered}'.")
+                    self._active_groq_model = discovered
+                    continue
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:150]}")
+
+            data = resp.json()
+            text = (data["choices"][0]["message"]["content"] or "").strip()
+            if not text:
+                raise ValueError("Empty response from Groq.")
+
+            est_tokens = (len(system_instruction) + len(prompt) + len(text)) // 3
+            await self.db.log_api_usage(self._get_today_str(), est_tokens)
+            return text
+
+        raise RuntimeError("Groq failed after model discovery retry.")
