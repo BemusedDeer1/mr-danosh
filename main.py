@@ -83,10 +83,6 @@ async def run_bot() -> None:
     )
     await human_features.init_tables()
 
-    # بازیابی سقف ساعتی ذخیره‌شده در دیتابیس (در صورت تغییر قبلی توسط مدیر)
-    saved_limit = await db.get_setting("max_replies_hour")
-    hourly_limit = int(saved_limit) if saved_limit and saved_limit.isdigit() else settings.MAX_REPLIES_PER_HOUR
-
     ai_service = AIService(settings, db)
     await ai_service.start()
 
@@ -94,9 +90,11 @@ async def run_bot() -> None:
     group_ctx = GroupContextManager(db, settings.TIMEZONE)
     profiler = UserProfiler(settings, db, batch_size=15)
     memory = MemoryManager(db, group_ctx, profiler, settings.TIMEZONE)
+
+    # بدون محدودیت ساعتی یا فاصله زمانی برای چت آزاد در گروه
     rate_limiter = RateLimiter(
-        min_interval_sec=settings.MIN_REPLY_INTERVAL_SEC,
-        max_replies_per_hour=hourly_limit,
+        min_interval_sec=0,
+        max_replies_per_hour=999999,
     )
     event_detector = EventDetector(db, memory)
 
@@ -119,7 +117,6 @@ async def run_bot() -> None:
     )
 
     dp = Dispatcher()
-    # ترتیب ثبت روترها: ابتدا دستورات ادمین، سپس قابلیت‌های طنز، و در نهایت پردازش پیام‌های عمومی
     dp.include_router(admin_panel.router)
     dp.include_router(fun_features.router)
     dp.include_router(social_handlers.router)
