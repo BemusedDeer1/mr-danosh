@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 import time
 from typing import Optional
 
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class SocialHandlers:
-    """مدیریت پیام‌های گروهی و خصوصی با رفع باگ‌های گروه و سیستم قهر و آشتی."""
+    """مدیریت پیام‌های گروهی و خصوصی بدون محدودیت سقف پاسخ و با سیستم قهر و آشتی."""
 
     NAME_TRIGGERS = ("دانشور", "دانوش", "معاون", "استاد")
     APOLOGY_WORDS = ("ببخشید", "شرمنده", "غلط کردم", "معذرت", "حلال کن", "شوخی کردم", "ناراحت نشو")
@@ -372,7 +371,7 @@ class SocialHandlers:
         await self._send_safe_reply(message, f"⚖️ <b>حکم آقای دانشور:</b>\n{safe_reply}")
 
     async def on_text_message(self, message: types.Message, bot: Bot) -> None:
-        """خط اصلی پردازش پیام‌های متنی گروه و خصوصی."""
+        """خط اصلی پردازش پیام‌های متنی گروه و خصوصی (بدون محدودیت سقف پیام)."""
         if not message.from_user or message.from_user.is_bot or not message.text:
             return
         if not await self._is_group_allowed(message.chat, bot):
@@ -389,6 +388,7 @@ class SocialHandlers:
         lower_text = text.lower()
         is_pv = message.chat.type == "private"
 
+        # جلوگیری از پردازش تکراریِ یک پیام واحد
         is_fresh = await self.limiter.register_human_message(chat_id, user_id, message.message_id, text)
         if not is_fresh:
             return
@@ -407,13 +407,13 @@ class SocialHandlers:
         )
         await self.human.auto_update_disciplinary_file(user_id, text)
 
-        # مدیریت قهر ۱۵ دقیقه‌ای و آشتی با عذرخواهی (فقط مورد ۴)
+        # مدیریت قهر ۱۵ دقیقه‌ای و آشتی با عذرخواهی
         if any(bad in lower_text for bad in self.human.INSULT_TRIGGERS):
             self._grudge_until[user_id] = time.time() + 900
         elif user_id in self._grudge_until and any(ap in lower_text for ap in self.APOLOGY_WORDS):
             del self._grudge_until[user_id]
 
-        # ۲. بازیابی بافت گروه (محافظت‌شده در برابر خطا تا در گروه متوقف نشود)
+        # ۲. بازیابی بافت گروه
         rep_text = message.reply_to_message.text if message.reply_to_message else None
         rep_sender = (
             message.reply_to_message.from_user.full_name
@@ -474,7 +474,6 @@ class SocialHandlers:
         prob_str = await self.db.get_setting("response_prob")
         base_prob = float(prob_str) if prob_str is not None else self.settings.RESPONSE_PROBABILITY
 
-        # اگر کاربر با @ یا ریپلای یا صدا زدن اسم «دانشور/دانوش/معاون» مخاطب قرارش داده، حتماً جواب بدهد
         direct_mention_flag = is_mentioned or is_name_called
 
         trigger_ctx = TriggerContext(
@@ -493,19 +492,9 @@ class SocialHandlers:
         )
         decision = TriggerEngine.evaluate(trigger_ctx)
         if not decision.should_reply:
-            logger.info(
-                f"Group message skipped by TriggerEngine in chat={chat_id} | "
-                f"reply_to_bot={is_reply_to_bot} | mentioned={direct_mention_flag} | reason={decision.reason}"
-            )
             return
 
-        # ۴. بررسی محدودیت نرخ ارسال (Rate Limiter)
-        allowed, limit_reason = await self.limiter.can_reply(chat_id, user_id, decision.is_definite)
-        if not allowed:
-            logger.info(f"Reply suppressed by rate limiter ({limit_reason}) in chat={chat_id}")
-            return
-
-        # ۵. انتخاب حالت رفتاری (با لحاظ کردن وضعیت قهر)
+        # ۴. انتخاب حالت رفتاری (با لحاظ کردن وضعیت قهر)
         is_distress = snapshot.tone in ("serious", "sensitive") or SafetyGuard.detect_distress_or_serious(text)
         is_bot_q = SafetyGuard.is_serious_bot_identity_question(text)
 
