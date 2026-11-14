@@ -17,6 +17,7 @@ from app.event_detector import EventDetector
 from app.fun_features import FunFeatures
 from app.group_context import GroupContextManager
 from app.handlers import SocialHandlers
+from app.human_features import HumanFeaturesManager
 from app.memory_manager import MemoryManager
 from app.personality import DaneshvarPersonality
 from app.rate_limiter import RateLimiter
@@ -75,6 +76,13 @@ async def run_bot() -> None:
     db = DatabaseManager(settings.DATABASE_PATH, settings.TIMEZONE)
     await db.connect()
 
+    # راه‌اندازی جدول‌های امکانات انسانی (ری‌اکشن، پرونده و لقب، خاطرات واقعی)
+    human_features = HumanFeaturesManager(
+        db_path=settings.DATABASE_PATH,
+        timezone=settings.TIMEZONE,
+    )
+    await human_features.init_tables()
+
     # بازیابی سقف ساعتی ذخیره‌شده در دیتابیس (در صورت تغییر قبلی توسط مدیر)
     saved_limit = await db.get_setting("max_replies_hour")
     hourly_limit = int(saved_limit) if saved_limit and saved_limit.isdigit() else settings.MAX_REPLIES_PER_HOUR
@@ -107,6 +115,7 @@ async def run_bot() -> None:
         memory=memory,
         rate_limiter=rate_limiter,
         event_detector=event_detector,
+        human_features=human_features,
     )
 
     dp = Dispatcher()
