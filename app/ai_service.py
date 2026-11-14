@@ -29,11 +29,10 @@ class AIRequestTask:
 
 
 class AIService:
-    """موتور ترکیبی Gemini + Groq با کشف خودکار مدل فعال، Circuit Breaker مجزا و Fallback."""
+    """موتور ترکیبی Gemini + Groq با بهینه‌سازی نگارش فارسی و Fallback."""
 
     CORE_FALLBACKS = [
         "ببین الان خط‌کشم افتاد زمین، حواسم پرت شد! دوباره بگو ببینم قضیه چیه؟",
-        "نه ببین، این حرفی که زدی خودش جای بررسی انضباطی داره، فعلاً بگذریم تا بعد!",
         "آقا شلوغ نکنید! یه لحظه سکوت رو رعایت کنید تا پرونده‌تون رو بررسی کنم.",
         "اینا همش بازیه عزیزم، می‌خوان با همین بحث‌ها حواستون رو از درس و نظم پرت کنن!",
     ]
@@ -181,7 +180,6 @@ class AIService:
                 self.queue.task_done()
 
     async def _generate_with_failover(self, system_instruction: str, prompt: str) -> str:
-        """تلاش با Gemini و در صورت شلوغی یا خطا، سوئیچ فوری روی Groq."""
         gemini_err: Optional[Exception] = None
 
         if time.time() >= self.gemini_open_until:
@@ -220,7 +218,7 @@ class AIService:
             try:
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    temperature=self.settings.AI_TEMPERATURE,
+                    temperature=min(self.settings.AI_TEMPERATURE, 0.7),
                     max_output_tokens=self.settings.AI_MAX_OUTPUT_TOKENS,
                     safety_settings=safety_settings,
                 )
@@ -251,7 +249,7 @@ class AIService:
         raise last_exc
 
     async def _discover_best_groq_model(self) -> Optional[str]:
-        """دریافت خودکار لیست مدل‌های فعال اکانت Groq در صورت منقضی شدن مدل پیش‌فرض."""
+        """انتخاب بهترین مدل فارسی‌زبان موجود در اکانت Groq (دوری از مدل‌های ضعیف 8B)."""
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/models"
         headers = {"Authorization": f"Bearer {self.settings.GROQ_API_KEY}"}
@@ -260,7 +258,7 @@ class AIService:
             return None
 
         models_data = resp.json().get("data", [])
-        excluded_keywords = ("whisper", "guard", "tts", "embed", "vision", "orpheus")
+        excluded_keywords = ("whisper", "guard", "tts", "embed", "vision", "orpheus", "8b-instant")
         candidates = [
             m["id"]
             for m in models_data
@@ -269,21 +267,27 @@ class AIService:
         if not candidates:
             return None
 
-        # اولویت‌بندی مدل‌های بزرگ و قوی برای زبان فارسی
-        for pref in ("70b", "qwen", "llama-4", "llama-3", "gemma", "8b"):
+        # مدل‌های qwen و 70b و llama-4 فارسی رو خیلی روان‌تر و با معنی‌تر از مدل‌های کوچیک می‌نویسن
+        for pref in ("qwen", "70b", "llama-4", "gpt-oss-120b", "gpt-oss-20b", "gemma"):
             for cid in candidates:
                 if pref in cid.lower():
                     return cid
         return candidates[0]
 
     async def _call_groq(self, system_instruction: str, prompt: str) -> str:
-        """فراخوانی Groq API با کشف خودکار مدل در صورت خطای 404."""
+        """فراخوانی Groq API با دمای کنترل‌شده (0.52) برای جلوگیری از بهم‌ریختگی جملات فارسی."""
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.GROQ_API_KEY}",
             "Content-Type": "application/json",
         }
+
+        # اگر مدل پیش‌فرض روی یک مدل ضعیف 8b مونده بود، قبل از ارسال ارتقاش بده
+        if "8b" in self._active_groq_model.lower():
+            better = await self._discover_best_groq_model()
+            if better:
+                self._active_groq_model = better
 
         for attempt in range(2):
             payload = {
@@ -292,7 +296,8 @@ class AIService:
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": self.settings.AI_TEMPERATURE,
+                "temperature": 0.52,
+                "top_p": 0.9,
                 "max_tokens": self.settings.AI_MAX_OUTPUT_TOKENS,
             }
             resp = await self.http_client.post(url, headers=headers, json=payload)
@@ -309,6 +314,9 @@ class AIService:
 
             data = resp.json()
             text = (data["choices"][0]["message"]["content"] or "").strip()
+            # حذف تگ‌های احتمالی <think> در مدل‌های استدلالی مثل Qwen
+            if "</think>" in text:
+                text = text.split("</think>")[-1].strip()
             if not text:
                 raise ValueError("Empty response from Groq.")
 
