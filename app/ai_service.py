@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,12 +30,12 @@ class AIRequestTask:
 
 
 class AIService:
-    """موتور ترکیبی Gemini + Groq با بهینه‌سازی نگارش فارسی و Fallback."""
+    """موتور ترکیبی Gemini + Groq با فضای استدلال مخفی، ضدتکرار و نگارش روان فارسی."""
 
     CORE_FALLBACKS = [
-        "ببین الان خط‌کشم افتاد زمین، حواسم پرت شد! دوباره بگو ببینم قضیه چیه؟",
-        "آقا شلوغ نکنید! یه لحظه سکوت رو رعایت کنید تا پرونده‌تون رو بررسی کنم.",
-        "اینا همش بازیه عزیزم، می‌خوان با همین بحث‌ها حواستون رو از درس و نظم پرت کنن!",
+        "الان حواسم پرت پرونده‌های دفتر بود، یه بار دیگه دقیق بگو ببینم چی میگی؟",
+        "صبر کن ببینم، الان خط‌کشم افتاد زمین! دوباره بگو قضیه چیه؟",
+        "آقا یه لحظه آروم بگیرید، صدای همتون قاطی شد نفهمیدم چی گفتی!",
     ]
 
     GEMINI_BACKUPS = [
@@ -61,7 +62,7 @@ class AIService:
 
     async def start(self) -> None:
         self._running = True
-        self.http_client = httpx.AsyncClient(timeout=20.0)
+        self.http_client = httpx.AsyncClient(timeout=25.0)
         self._workers = [asyncio.create_task(self._worker_loop(i)) for i in range(2)]
         groq_status = f"enabled ({self._active_groq_model})" if self.settings.GROQ_API_KEY else "disabled"
         logger.info(
@@ -116,6 +117,18 @@ class AIService:
                 chain.append(m)
         return chain[:2]
 
+    @staticmethod
+    def _strip_reasoning_tags(raw_text: str) -> str:
+        """حذف بخش‌های فکر کردن مخفی (<think> و <thought>) و استخراج پاسخ نهایی."""
+        text = raw_text.strip()
+        if "</think>" in text:
+            text = text.split("</think>")[-1].strip()
+        if "</thought>" in text:
+            text = text.split("</thought>")[-1].strip()
+        text = re.sub(r"<(think|thought)>.*?</\1>", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"</?(think|thought)>", "", text).strip()
+        return text
+
     async def generate_text(
         self,
         system_instruction: str,
@@ -151,7 +164,7 @@ class AIService:
 
         try:
             self.queue.put_nowait(task)
-            result = await asyncio.wait_for(task.future, timeout=40.0)
+            result = await asyncio.wait_for(task.future, timeout=45.0)
             return result
         except Exception as exc:
             logger.error(f"All AI providers failed or timed out: {exc}")
@@ -218,8 +231,8 @@ class AIService:
             try:
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    temperature=min(self.settings.AI_TEMPERATURE, 0.7),
-                    max_output_tokens=self.settings.AI_MAX_OUTPUT_TOKENS,
+                    temperature=0.72,
+                    max_output_tokens=1500,
                     safety_settings=safety_settings,
                 )
                 response = await asyncio.wait_for(
@@ -228,9 +241,9 @@ class AIService:
                         contents=prompt,
                         config=config,
                     ),
-                    timeout=14.0,
+                    timeout=16.0,
                 )
-                text = (response.text or "").strip()
+                text = self._strip_reasoning_tags(response.text or "")
                 if not text:
                     raise ValueError(f"Empty response from Gemini '{model_name}'.")
 
@@ -243,13 +256,12 @@ class AIService:
                 last_exc = exc
                 logger.warning(f"Gemini '{model_name}' failed: {str(exc)[:90]}")
                 if idx < len(models_to_try) - 1:
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(0.6)
 
         assert last_exc is not None
         raise last_exc
 
     async def _discover_best_groq_model(self) -> Optional[str]:
-        """انتخاب بهترین مدل فارسی‌زبان موجود در اکانت Groq (دوری از مدل‌های ضعیف 8B)."""
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/models"
         headers = {"Authorization": f"Bearer {self.settings.GROQ_API_KEY}"}
@@ -267,7 +279,6 @@ class AIService:
         if not candidates:
             return None
 
-        # مدل‌های qwen و 70b و llama-4 فارسی رو خیلی روان‌تر و با معنی‌تر از مدل‌های کوچیک می‌نویسن
         for pref in ("qwen", "70b", "llama-4", "gpt-oss-120b", "gpt-oss-20b", "gemma"):
             for cid in candidates:
                 if pref in cid.lower():
@@ -275,7 +286,7 @@ class AIService:
         return candidates[0]
 
     async def _call_groq(self, system_instruction: str, prompt: str) -> str:
-        """فراخوانی Groq API با دمای کنترل‌شده (0.52) برای جلوگیری از بهم‌ریختگی جملات فارسی."""
+        """فراخوانی Groq با توکن کافی برای استدلال (2048) و جریمه تکرار کلمات."""
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
@@ -283,7 +294,6 @@ class AIService:
             "Content-Type": "application/json",
         }
 
-        # اگر مدل پیش‌فرض روی یک مدل ضعیف 8b مونده بود، قبل از ارسال ارتقاش بده
         if "8b" in self._active_groq_model.lower():
             better = await self._discover_best_groq_model()
             if better:
@@ -296,9 +306,11 @@ class AIService:
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": 0.52,
+                "temperature": 0.65,
                 "top_p": 0.9,
-                "max_tokens": self.settings.AI_MAX_OUTPUT_TOKENS,
+                "frequency_penalty": 0.5,
+                "presence_penalty": 0.6,
+                "max_tokens": 2048,
             }
             resp = await self.http_client.post(url, headers=headers, json=payload)
 
@@ -313,12 +325,10 @@ class AIService:
                 raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:150]}")
 
             data = resp.json()
-            text = (data["choices"][0]["message"]["content"] or "").strip()
-            # حذف تگ‌های احتمالی <think> در مدل‌های استدلالی مثل Qwen
-            if "</think>" in text:
-                text = text.split("</think>")[-1].strip()
+            raw_content = data["choices"][0]["message"]["content"] or ""
+            text = self._strip_reasoning_tags(raw_content)
             if not text:
-                raise ValueError("Empty response from Groq.")
+                raise ValueError("Empty response after stripping reasoning tags from Groq.")
 
             est_tokens = (len(system_instruction) + len(prompt) + len(text)) // 3
             await self.db.log_api_usage(self._get_today_str(), est_tokens)
