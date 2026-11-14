@@ -30,12 +30,13 @@ class AIRequestTask:
 
 
 class AIService:
-    """موتور ترکیبی Gemini + Groq با فضای استدلال مخفی، ضدتکرار و نگارش روان فارسی."""
+    """موتور ترکیبی Gemini + چرخش هوشمند بین تمام مدل‌های Groq برای جلوگیری از خطای 429."""
 
     CORE_FALLBACKS = [
         "الان حواسم پرت پرونده‌های دفتر بود، یه بار دیگه دقیق بگو ببینم چی میگی؟",
         "صبر کن ببینم، الان خط‌کشم افتاد زمین! دوباره بگو قضیه چیه؟",
         "آقا یه لحظه آروم بگیرید، صدای همتون قاطی شد نفهمیدم چی گفتی!",
+        "بذار ببینم چی شد، یه لحظه دفتر انضباطی رو چک کنم الان برمی‌گردم!",
     ]
 
     GEMINI_BACKUPS = [
@@ -54,7 +55,11 @@ class AIService:
 
         self.gemini_failures = 0
         self.gemini_open_until: float = 0.0
-        self._active_groq_model: str = settings.GROQ_MODEL
+
+        # لیست مدل‌های کشف‌شده Groq و مدل‌هایی که موقتاً 429 خورده‌اند
+        self._groq_models_cache: list[str] = []
+        self._groq_models_fetched_at: float = 0.0
+        self._groq_cooldown_until: dict[str, float] = {}
 
         self._cache: dict[str, tuple[str, float]] = {}
         self._workers: list[asyncio.Task] = []
@@ -62,9 +67,9 @@ class AIService:
 
     async def start(self) -> None:
         self._running = True
-        self.http_client = httpx.AsyncClient(timeout=25.0)
+        self.http_client = httpx.AsyncClient(timeout=22.0)
         self._workers = [asyncio.create_task(self._worker_loop(i)) for i in range(2)]
-        groq_status = f"enabled ({self._active_groq_model})" if self.settings.GROQ_API_KEY else "disabled"
+        groq_status = "enabled (multi-model rotation)" if self.settings.GROQ_API_KEY else "disabled"
         logger.info(
             f"AIService started | Primary Gemini: '{self.settings.AI_MODEL}' | Backup Groq: {groq_status}"
         )
@@ -203,7 +208,9 @@ class AIService:
             except Exception as exc:
                 gemini_err = exc
                 self.gemini_failures += 1
-                if self.gemini_failures >= 4:
+                # اگر جمنای 429 داد، سریع‌تر مدار را باز کن تا مستقیم برود سراغ Groq
+                threshold = 2 if "429" in str(exc) else 4
+                if self.gemini_failures >= threshold:
                     self.gemini_open_until = time.time() + 180
                     logger.warning("Gemini circuit breaker OPEN for 180s; routing directly to Groq.")
         else:
@@ -211,11 +218,11 @@ class AIService:
 
         if self.settings.GROQ_API_KEY:
             try:
-                text = await self._call_groq(system_instruction, prompt)
-                logger.info(f"Successfully generated reply via Groq ({self._active_groq_model}).")
+                text, used_model = await self._call_groq_rotated(system_instruction, prompt)
+                logger.info(f"Successfully generated reply via Groq ({used_model}).")
                 return text
             except Exception as groq_exc:
-                logger.error(f"Groq backup also failed: {groq_exc}")
+                logger.error(f"All Groq models failed: {groq_exc}")
                 raise groq_exc
 
         if gemini_err:
@@ -232,7 +239,7 @@ class AIService:
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.72,
-                    max_output_tokens=1500,
+                    max_output_tokens=700,
                     safety_settings=safety_settings,
                 )
                 response = await asyncio.wait_for(
@@ -241,7 +248,7 @@ class AIService:
                         contents=prompt,
                         config=config,
                     ),
-                    timeout=16.0,
+                    timeout=14.0,
                 )
                 text = self._strip_reasoning_tags(response.text or "")
                 if not text:
@@ -256,37 +263,54 @@ class AIService:
                 last_exc = exc
                 logger.warning(f"Gemini '{model_name}' failed: {str(exc)[:90]}")
                 if idx < len(models_to_try) - 1:
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.4)
 
         assert last_exc is not None
         raise last_exc
 
-    async def _discover_best_groq_model(self) -> Optional[str]:
+    async def _get_ranked_groq_models(self) -> list[str]:
+        """دریافت و اولویت‌بندی تمام مدل‌های چت فعال در اکانت Groq."""
+        now = time.time()
+        if self._groq_models_cache and (now - self._groq_models_fetched_at < 600):
+            return self._groq_models_cache
+
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/models"
         headers = {"Authorization": f"Bearer {self.settings.GROQ_API_KEY}"}
-        resp = await self.http_client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return None
+        try:
+            resp = await self.http_client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return [self.settings.GROQ_MODEL]
+        except Exception:
+            return [self.settings.GROQ_MODEL]
 
         models_data = resp.json().get("data", [])
-        excluded_keywords = ("whisper", "guard", "tts", "embed", "vision", "orpheus", "8b-instant")
-        candidates = [
+        excluded = ("whisper", "guard", "tts", "embed", "vision", "orpheus", "safeguard")
+        raw_ids = [
             m["id"]
             for m in models_data
-            if m.get("id") and not any(bad in m["id"].lower() for bad in excluded_keywords)
+            if m.get("id") and not any(bad in m["id"].lower() for bad in excluded)
         ]
-        if not candidates:
-            return None
 
-        for pref in ("qwen", "70b", "llama-4", "gpt-oss-120b", "gpt-oss-20b", "gemma"):
-            for cid in candidates:
-                if pref in cid.lower():
-                    return cid
-        return candidates[0]
+        # اولویت‌بندی مدل‌های قوی‌تر (ابتدا مدل‌های بزرگ فارسی‌زبان، سپس مدل‌های سبک‌تر به عنوان پشتیبان نهایی)
+        priority_order = ("llama-4", "70b", "gpt-oss-120b", "qwen", "gpt-oss-20b", "gemma", "8b")
+        ranked: list[str] = []
+        for keyword in priority_order:
+            for mid in raw_ids:
+                if keyword in mid.lower() and mid not in ranked:
+                    ranked.append(mid)
+        for mid in raw_ids:
+            if mid not in ranked:
+                ranked.append(mid)
 
-    async def _call_groq(self, system_instruction: str, prompt: str) -> str:
-        """فراخوانی Groq با توکن کافی برای استدلال (2048) و جریمه تکرار کلمات."""
+        if ranked:
+            self._groq_models_cache = ranked
+            self._groq_models_fetched_at = now
+            logger.info(f"Discovered {len(ranked)} active Groq models: {ranked}")
+        return ranked or [self.settings.GROQ_MODEL]
+
+    async def _call_groq_rotated(self, system_instruction: str, prompt: str) -> tuple[str, str]:
+        """چرخش آنی بین مدل‌های Groq هنگام خطای 429 (TPM) یا 404."""
         assert self.http_client is not None
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
@@ -294,44 +318,62 @@ class AIService:
             "Content-Type": "application/json",
         }
 
-        if "8b" in self._active_groq_model.lower():
-            better = await self._discover_best_groq_model()
-            if better:
-                self._active_groq_model = better
+        all_models = await self._get_ranked_groq_models()
+        now = time.time()
 
-        for attempt in range(2):
+        # مدل‌هایی که در کول‌داون 429 نیستند اولویت دارند
+        available = [m for m in all_models if now >= self._groq_cooldown_until.get(m, 0.0)]
+        if not available:
+            available = all_models
+
+        last_exc: Optional[Exception] = None
+        # حداکثر ۴ مدل مختلف را پشت سر هم تست کن
+        for model_id in available[:4]:
             payload = {
-                "model": self._active_groq_model,
+                "model": model_id,
                 "messages": [
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.65,
                 "top_p": 0.9,
-                "frequency_penalty": 0.5,
-                "presence_penalty": 0.6,
-                "max_tokens": 2048,
+                "frequency_penalty": 0.45,
+                "presence_penalty": 0.5,
+                "max_tokens": 650,
             }
-            resp = await self.http_client.post(url, headers=headers, json=payload)
+            try:
+                resp = await self.http_client.post(url, headers=headers, json=payload)
+            except Exception as net_exc:
+                last_exc = net_exc
+                continue
 
-            if resp.status_code == 404 and attempt == 0:
-                discovered = await self._discover_best_groq_model()
-                if discovered and discovered != self._active_groq_model:
-                    logger.info(f"Groq model '{self._active_groq_model}' unavailable; auto-switched to '{discovered}'.")
-                    self._active_groq_model = discovered
-                    continue
+            if resp.status_code == 429:
+                # این مدل به سقف TPM دقیقه رسیده؛ ۴۵ ثانیه بفرستش استراحت و برو سراغ مدل بعدی
+                self._groq_cooldown_until[model_id] = time.time() + 45
+                last_exc = RuntimeError(f"Groq 429 TPM limit on {model_id}")
+                logger.warning(f"Groq model '{model_id}' hit 429 rate limit; rotating immediately to next model...")
+                continue
+
+            if resp.status_code == 404:
+                self._groq_cooldown_until[model_id] = time.time() + 3600
+                last_exc = RuntimeError(f"Groq 404 on {model_id}")
+                continue
 
             if resp.status_code != 200:
-                raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:150]}")
+                last_exc = RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:120]}")
+                continue
 
             data = resp.json()
             raw_content = data["choices"][0]["message"]["content"] or ""
             text = self._strip_reasoning_tags(raw_content)
             if not text:
-                raise ValueError("Empty response after stripping reasoning tags from Groq.")
+                last_exc = ValueError(f"Empty response from Groq '{model_id}'.")
+                continue
 
             est_tokens = (len(system_instruction) + len(prompt) + len(text)) // 3
             await self.db.log_api_usage(self._get_today_str(), est_tokens)
-            return text
+            return text, model_id
 
-        raise RuntimeError("Groq failed after model discovery retry.")
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("No Groq models available.")
