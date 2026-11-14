@@ -1,5 +1,4 @@
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -13,25 +12,26 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
     BOT_USERNAME: str
 
-    # موتور پشتیبان Groq (رایگان و فوق‌العاده سریع)
+    # موتور پشتیبان Groq
     GROQ_API_KEY: Optional[str] = None
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
     ADMIN_IDS: str = ""
     GROUP_CHAT_ID: Optional[str] = None
 
-    AI_MODEL: str = "gemini-2.5-flash-lite"
-    AI_TEMPERATURE: float = 0.85
+    AI_MODEL: str = "gemini-3.8-flash"
+    AI_TEMPERATURE: float = 0.65
     AI_MAX_OUTPUT_TOKENS: int = 1000
     AI_ENABLE_SAFETY_FILTERS: bool = False
 
     DATABASE_PATH: str = "data/daneshvar.db"
     TIMEZONE: str = "Asia/Tehran"
 
-    RESPONSE_PROBABILITY: float = 0.08
-    MIN_REPLY_INTERVAL_SEC: int = 5
-    MAX_REPLIES_PER_HOUR: int = 25
-    DAILY_API_CALL_LIMIT: int = 800
+    # افزایش سقف پاسخ‌دهی در گروه تا وسط چت قفل نکند
+    RESPONSE_PROBABILITY: float = 0.12
+    MIN_REPLY_INTERVAL_SEC: int = 2
+    MAX_REPLIES_PER_HOUR: int = 150
+    DAILY_API_CALL_LIMIT: int = 1500
 
     LOG_LEVEL: str = "INFO"
 
