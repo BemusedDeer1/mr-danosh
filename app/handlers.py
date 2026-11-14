@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import time
 from typing import Optional
 
 from aiogram import Bot, F, Router, types
@@ -25,7 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 class SocialHandlers:
-    """مدیریت کامل پیام‌های گروهی و خصوصی، حریم خصوصی کاربران و تعاملات شخصیت محور."""
+    """مدیریت پیام‌های گروهی و خصوصی با رفع باگ‌های گروه و سیستم قهر و آشتی."""
+
+    NAME_TRIGGERS = ("دانشور", "دانوش", "معاون", "استاد")
+    APOLOGY_WORDS = ("ببخشید", "شرمنده", "غلط کردم", "معذرت", "حلال کن", "شوخی کردم", "ناراحت نشو")
 
     def __init__(
         self,
@@ -47,13 +51,17 @@ class SocialHandlers:
         self.detector = event_detector
         self.human = human_features
         self.router = Router(name="social_router")
+
+        # تایمر ۱۵ دقیقه‌ای قهر و سرسنگین بودن با کاربر (user_id -> timestamp پایان قهر)
+        self._grudge_until: dict[int, float] = {}
+        self._bot_username_cache: Optional[str] = None
+
         self._register_routes()
 
     def _register_routes(self) -> None:
-        # رویداد اضافه شدن ربات به گروه
         self.router.my_chat_member.register(self.on_bot_added_to_group)
 
-        # دستورات عمومی و کنترل حریم خصوصی کاربر
+        # دستورات عمومی و حریم خصوصی
         self.router.message.register(self.cmd_start, CommandStart())
         self.router.message.register(self.cmd_about, Command("about"))
         self.router.message.register(self.cmd_privacy, Command("privacy"))
@@ -70,7 +78,6 @@ class SocialHandlers:
         self.router.message.register(self.cmd_del_lore, Command("del_lore"))
         self.router.message.register(self.cmd_set_nick, Command("set_nick"))
 
-        # کال‌بک تأیید حذف داده‌های کاربر
         self.router.callback_query.register(self.cb_confirm_forgetme, F.data.startswith("forgetme:"))
 
         # پردازش تمام پیام‌های متنی عادی
@@ -82,8 +89,19 @@ class SocialHandlers:
         admins = self.settings.admin_id_list
         return True if not admins else (user_id in admins)
 
+    async def _get_bot_username(self, bot: Bot) -> str:
+        if self._bot_username_cache:
+            return self._bot_username_cache
+        try:
+            me = await bot.get_me()
+            if me.username:
+                self._bot_username_cache = me.username.lower()
+                return self._bot_username_cache
+        except Exception:
+            pass
+        return (self.settings.BOT_USERNAME or "").lstrip("@").lower()
+
     async def _is_group_allowed(self, chat: types.Chat, bot: Bot) -> bool:
-        """بررسی محدودیت GROUP_CHAT_ID و خروج ایمن از گروه‌های ناشناس."""
         if chat.type == "private":
             return True
         allowed_id = self.settings.allowed_group_id
@@ -101,7 +119,6 @@ class SocialHandlers:
         return True
 
     async def on_bot_added_to_group(self, event: types.ChatMemberUpdated, bot: Bot) -> None:
-        """ارسال پیام معرفی و شفافیت حریم خصوصی هنگام عضویت در گروه."""
         if event.new_chat_member.status not in ("member", "administrator"):
             return
         if not await self._is_group_allowed(event.chat, bot):
@@ -183,7 +200,6 @@ class SocialHandlers:
         await message.answer(text)
 
     async def cmd_file(self, message: types.Message) -> None:
-        """نمایش لقب و سابقه انضباطی کاربر یا شخص ریپلای‌شده."""
         if not message.from_user:
             return
         target = (
@@ -204,7 +220,6 @@ class SocialHandlers:
         )
 
     async def cmd_add_lore(self, message: types.Message) -> None:
-        """ثبت خاطره یا تکیه‌کلام واقعی مدرسه توسط ادمین."""
         if not message.from_user or not self._is_admin(message.from_user.id):
             await message.answer("این دستور فقط دست خودم و ادمین‌هاست بچه!")
             return
@@ -219,7 +234,6 @@ class SocialHandlers:
         await message.answer(f"حله! خاطره شماره <b>{lore_id}</b> رفت تو حافظه‌م، سرِ بزنگاه به روشون میارم.")
 
     async def cmd_list_lore(self, message: types.Message) -> None:
-        """نمایش لیست خاطرات ثبت‌شده."""
         if not message.from_user or not self._is_admin(message.from_user.id):
             return
         items = await self.human.list_all_lores()
@@ -230,7 +244,6 @@ class SocialHandlers:
         await message.answer("📚 <b>لیست خاطره‌های ثبت‌شده:</b>\n\n" + "\n".join(lines))
 
     async def cmd_del_lore(self, message: types.Message) -> None:
-        """حذف یک خاطره با شماره ID."""
         if not message.from_user or not self._is_admin(message.from_user.id):
             return
         parts = (message.text or "").split(maxsplit=1)
@@ -241,7 +254,6 @@ class SocialHandlers:
         await message.answer("پاک شد رفت پی کارش." if ok else "همچین شماره‌ای پیدا نکردم.")
 
     async def cmd_set_nick(self, message: types.Message) -> None:
-        """ثبت لقب اختصاصی با ریپلای روی پیام کاربر."""
         if not message.from_user or not self._is_admin(message.from_user.id):
             await message.answer("فقط ادمین می‌تونه لقب ثبت کنه!")
             return
@@ -319,7 +331,6 @@ class SocialHandlers:
         await message.answer("بههه! خوش برگشتید به جمع! پروفایل‌سازی دوستانه برای شما دوباره فعال شد.")
 
     async def cmd_judge(self, message: types.Message, bot: Bot) -> None:
-        """دستور /judge برای داوری طنز و انضباطی وسط بحث‌های گروه."""
         if not message.from_user or not await self._is_group_allowed(message.chat, bot):
             return
 
@@ -367,7 +378,6 @@ class SocialHandlers:
         if not await self._is_group_allowed(message.chat, bot):
             return
 
-        # بررسی وضعیت توقف موقت (/pause) توسط مدیر
         paused_flag = await self.db.get_setting("paused", "0")
         if paused_flag == "1":
             return
@@ -376,14 +386,14 @@ class SocialHandlers:
         user_id = message.from_user.id
         full_name = message.from_user.full_name
         text = message.text.strip()
+        lower_text = text.lower()
         is_pv = message.chat.type == "private"
 
-        # جلوگیری از پردازش پیام تکراری یا اسپم سریع
         is_fresh = await self.limiter.register_human_message(chat_id, user_id, message.message_id, text)
         if not is_fresh:
             return
 
-        # ۱. ثبت در حافظه سه‌لایه و آپدیت پرونده انضباطی/لقب
+        # ۱. ثبت در حافظه سه‌لایه و پرونده انضباطی
         reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
         profile = await self.memory.process_incoming_message(
             chat_id=chat_id,
@@ -397,7 +407,13 @@ class SocialHandlers:
         )
         await self.human.auto_update_disciplinary_file(user_id, text)
 
-        # ۲. بازیابی بافت گروه و تشخیص رویدادها (در گروه)
+        # مدیریت قهر ۱۵ دقیقه‌ای و آشتی با عذرخواهی (فقط مورد ۴)
+        if any(bad in lower_text for bad in self.human.INSULT_TRIGGERS):
+            self._grudge_until[user_id] = time.time() + 900
+        elif user_id in self._grudge_until and any(ap in lower_text for ap in self.APOLOGY_WORDS):
+            del self._grudge_until[user_id]
+
+        # ۲. بازیابی بافت گروه (محافظت‌شده در برابر خطا تا در گروه متوقف نشود)
         rep_text = message.reply_to_message.text if message.reply_to_message else None
         rep_sender = (
             message.reply_to_message.from_user.full_name
@@ -419,49 +435,53 @@ class SocialHandlers:
             and message.reply_to_message.from_user
             and message.reply_to_message.from_user.id == bot.id
         )
-        is_mentioned = f"@{self.settings.BOT_USERNAME}" in text.lower()
+        bot_username = await self._get_bot_username(bot)
+        is_mentioned = bool(bot_username and f"@{bot_username}" in lower_text)
+        is_name_called = any(name in lower_text for name in self.NAME_TRIGGERS)
 
         if not is_pv:
-            event = await self.detector.inspect_message(
-                chat_id=chat_id,
-                user_id=user_id,
-                sender_name=full_name,
-                text=text,
-                snapshot=snapshot,
-                is_opted_out=profile.opted_out,
-            )
-            if event.should_record_episode and event.episode_summary:
-                await self.memory.record_episode(
+            try:
+                event = await self.detector.inspect_message(
                     chat_id=chat_id,
-                    summary=event.episode_summary,
-                    user_ids=[user_id],
-                    tags=event.episode_tags,
-                    importance=event.importance,
+                    user_id=user_id,
+                    sender_name=full_name,
+                    text=text,
+                    snapshot=snapshot,
+                    is_opted_out=profile.opted_out,
                 )
-            if event.discipline_delta != 0:
-                await self.db.adjust_discipline_score(user_id, event.discipline_delta)
+                if event.should_record_episode and event.episode_summary:
+                    await self.memory.record_episode(
+                        chat_id=chat_id,
+                        summary=event.episode_summary,
+                        user_ids=[user_id],
+                        tags=event.episode_tags,
+                        importance=event.importance,
+                    )
+                if event.discipline_delta != 0:
+                    await self.db.adjust_discipline_score(user_id, event.discipline_delta)
+            except Exception as exc:
+                logger.warning(f"EventDetector non-fatal error in group {chat_id}: {exc}")
 
-            # ری‌اکشن هوشمند انسانی (شامل 🖕 هنگام بی‌احترامی و ری‌اکشن‌های متنی در گروه)
-            reacted = await self.human.maybe_react(
+            # ری‌اکشن هوشمند انسانی (شامل 🖕 هنگام بی‌احترامی)
+            await self.human.maybe_react(
                 message,
-                is_reply_to_bot=(is_reply_to_bot or is_mentioned),
+                is_reply_to_bot=(is_reply_to_bot or is_mentioned or is_name_called),
                 probability=0.45,
             )
-            if not reacted and event.suggested_reaction and random.random() < 0.25:
-                await self._try_react(message, event.suggested_reaction)
 
-        # ۳. تصمیم‌گیری درباره پاسخ‌گویی با TriggerEngine
+        # ۳. تصمیم‌گیری درباره پاسخ‌گویی
         sec_since_last = await self.limiter.seconds_since_last_reply(chat_id)
-
-        # خواندن احتمال پویای تنظیم‌شده توسط ادمین (در صورت وجود)
         prob_str = await self.db.get_setting("response_prob")
         base_prob = float(prob_str) if prob_str is not None else self.settings.RESPONSE_PROBABILITY
+
+        # اگر کاربر با @ یا ریپلای یا صدا زدن اسم «دانشور/دانوش/معاون» مخاطب قرارش داده، حتماً جواب بدهد
+        direct_mention_flag = is_mentioned or is_name_called
 
         trigger_ctx = TriggerContext(
             is_private=is_pv,
             is_command=text.startswith("/"),
             is_reply_to_bot=is_reply_to_bot,
-            is_mentioned=is_mentioned,
+            is_mentioned=direct_mention_flag,
             text=text,
             base_probability=base_prob,
             recent_msg_count_5min=snapshot.recent_msg_count_5min,
@@ -473,19 +493,28 @@ class SocialHandlers:
         )
         decision = TriggerEngine.evaluate(trigger_ctx)
         if not decision.should_reply:
+            logger.info(
+                f"Group message skipped by TriggerEngine in chat={chat_id} | "
+                f"reply_to_bot={is_reply_to_bot} | mentioned={direct_mention_flag} | reason={decision.reason}"
+            )
             return
 
         # ۴. بررسی محدودیت نرخ ارسال (Rate Limiter)
         allowed, limit_reason = await self.limiter.can_reply(chat_id, user_id, decision.is_definite)
         if not allowed:
-            logger.debug(f"Reply suppressed by rate limiter ({limit_reason}) in chat={chat_id}")
+            logger.info(f"Reply suppressed by rate limiter ({limit_reason}) in chat={chat_id}")
             return
 
-        # ۵. انتخاب حالت رفتاری، ساخت پرامپت و تولید پاسخ
+        # ۵. انتخاب حالت رفتاری (با لحاظ کردن وضعیت قهر)
         is_distress = snapshot.tone in ("serious", "sensitive") or SafetyGuard.detect_distress_or_serious(text)
         is_bot_q = SafetyGuard.is_serious_bot_identity_question(text)
 
-        mode = self.personality.select_mode(message_text=text, group_tone=snapshot.tone)
+        is_grudging = time.time() < self._grudge_until.get(user_id, 0.0)
+        if is_grudging and not is_distress:
+            mode = self.personality.MODES["roast_troll"]
+        else:
+            mode = self.personality.select_mode(message_text=text, group_tone=snapshot.tone)
+
         blocked_phrases = self.personality.get_blocked_signatures()
 
         sys_inst, prompt = PromptBuilder.build_reply_prompts(
@@ -503,10 +532,8 @@ class SocialHandlers:
             user_file=await self.human.get_user_file(user_id),
             custom_lore=await self.human.get_random_lores(limit=3),
         )
-
-        # استفاده از Cache فقط برای احوالپرسی‌های ساده بدون وابستگی به پروفایل
-        is_simple_greeting = len(text) <= 20 and any(w in text for w in ["سلام", "درود بر دانشور"]) and not is_pv
-        cache_key = f"greet:{mode.key}:{text.strip()}" if is_simple_greeting else None
+        if is_grudging and not is_distress:
+            sys_inst += "\n[وضعیت روحی]: این کاربر چند دقیقه پیش به تو بی‌احترامی کرده و هنوز عذرخواهی نکرده؛ باهاش سرسنگین و تیکه‌پرون باش!"
 
         try:
             await bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -520,8 +547,6 @@ class SocialHandlers:
             system_instruction=sys_inst,
             prompt=prompt,
             priority=priority,
-            use_cache=is_simple_greeting,
-            cache_key=cache_key,
             fallback_pool=self.personality.FALLBACK_RESPONSES.get(mode.key),
         )
 
@@ -533,7 +558,6 @@ class SocialHandlers:
         logger.info(f"Replied in chat={chat_id} | mode={mode.key} | trigger={decision.reason}")
 
     async def _send_safe_reply(self, message: types.Message, html_text: str) -> None:
-        """ارسال پیام با مدیریت خطای RetryAfter تلگرام."""
         try:
             await message.reply(html_text)
         except TelegramRetryAfter as exc:
@@ -544,7 +568,6 @@ class SocialHandlers:
             logger.error(f"Telegram BadRequest on reply: {exc}")
 
     async def _try_react(self, message: types.Message, emoji: str) -> None:
-        """ارسال واکنش ایموجی کنترل‌شده با fallback کاملاً بی‌صدا در صورت عدم پشتیبانی گروه."""
         try:
             await message.react([ReactionTypeEmoji(emoji=emoji)])
         except Exception:
