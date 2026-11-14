@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 from typing import Optional
@@ -11,6 +12,7 @@ from app.ai_service import AIService
 from app.config import Settings
 from app.database import DatabaseManager
 from app.event_detector import EventDetector
+from app.human_features import HumanFeaturesManager
 from app.memory_manager import MemoryManager
 from app.personality import DaneshvarPersonality
 from app.prompt_builder import PromptBuilder
@@ -34,6 +36,7 @@ class SocialHandlers:
         memory: MemoryManager,
         rate_limiter: RateLimiter,
         event_detector: EventDetector,
+        human_features: HumanFeaturesManager,
     ):
         self.settings = settings
         self.db = db
@@ -42,6 +45,7 @@ class SocialHandlers:
         self.memory = memory
         self.limiter = rate_limiter
         self.detector = event_detector
+        self.human = human_features
         self.router = Router(name="social_router")
         self._register_routes()
 
@@ -59,11 +63,24 @@ class SocialHandlers:
         self.router.message.register(self.cmd_optin, Command("optin"))
         self.router.message.register(self.cmd_judge, Command("judge"))
 
+        # دستورات پرونده انضباطی، لقب و خاطرات واقعی مدرسه
+        self.router.message.register(self.cmd_file, Command("file"))
+        self.router.message.register(self.cmd_add_lore, Command("add_lore"))
+        self.router.message.register(self.cmd_list_lore, Command("list_lore"))
+        self.router.message.register(self.cmd_del_lore, Command("del_lore"))
+        self.router.message.register(self.cmd_set_nick, Command("set_nick"))
+
         # کال‌بک تأیید حذف داده‌های کاربر
         self.router.callback_query.register(self.cb_confirm_forgetme, F.data.startswith("forgetme:"))
 
         # پردازش تمام پیام‌های متنی عادی
         self.router.message.register(self.on_text_message, F.text)
+
+    def _is_admin(self, user_id: Optional[int]) -> bool:
+        if not user_id:
+            return False
+        admins = self.settings.admin_id_list
+        return True if not admins else (user_id in admins)
 
     async def _is_group_allowed(self, chat: types.Chat, bot: Bot) -> bool:
         """بررسی محدودیت GROUP_CHAT_ID و خروج ایمن از گروه‌های ناشناس."""
@@ -108,7 +125,7 @@ class SocialHandlers:
         today = get_jalali_date_str(self.settings.TIMEZONE)
         await message.answer(
             f"بههه! آقای {name}! چه عجب پیدات شد! امروز {today} هست.\n"
-            "برای آشنایی با قوانین و حریم خصوصی /about و /privacy رو بزن."
+            "برای آشنایی با قوانین و دستورات /about و /privacy رو بزن."
         )
 
     async def cmd_about(self, message: types.Message) -> None:
@@ -118,10 +135,12 @@ class SocialHandlers:
             "من اینجا هستم تا کنار بچه‌های گروه گپ بزنم، خاطرات خوب رو نگه دارم و نظم رو برقرار کنم.\n\n"
             "<b>دستورات کاربردی:</b>\n"
             "• /judge (یا ریپلای روی یک بحث): داوری رسمی آقای دانشور\n"
+            "• /file : دیدن لقب و پرونده انضباطی شما (یا شخص ریپلای‌شده)\n"
             "• /mydata : مشاهده اطلاعات ذخیره‌شده درباره شما\n"
             "• /optout و /optin : توقف یا فعال‌سازی یادگیری شخصیت\n"
             "• /forgetme : پاک کردن کامل داده‌های شما\n"
-            "• /privacy : سیاست شفاف حریم خصوصی"
+            "• /add_lore و /list_lore و /del_lore : مدیریت خاطرات واقعی مدرسه (ادمین)\n"
+            "• /set_nick : ثبت لقب با ریپلای روی پیام کاربر (ادمین)"
         )
         await message.answer(text)
 
@@ -149,16 +168,96 @@ class SocialHandlers:
 
         interests = "، ".join(f"{i.value} ({i.confidence})" for i in profile.interests) or "ثبت نشده"
         status = "غیرفعال (Opt-out)" if profile.opted_out else "فعال"
+        user_file = await self.human.get_user_file(message.from_user.id)
+        nick_line = f"\n• لقب ثبت‌شده: «{sanitize_telegram_html(user_file[0])}»" if user_file else ""
+
         text = (
             f"📁 <b>داده‌های ثبت‌شده برای {sanitize_telegram_html(profile.full_name)}</b>\n"
             f"• وضعیت پروفایل‌سازی: {status}\n"
             f"• تعداد پیام‌های ثبت‌شده در گروه: {profile.msg_count}\n"
             f"• علایق تشخیص‌داده‌شده: {sanitize_telegram_html(interests)}\n"
             f"• سبک شوخی / ارتباط: {sanitize_telegram_html(profile.humor_style)} / {sanitize_telegram_html(profile.comm_style)}\n"
-            f"• نمره انضباطی طنز: {profile.discipline_score} از ۱۰۰\n"
+            f"• نمره انضباطی طنز: {profile.discipline_score} از ۱۰۰{nick_line}\n"
             f"• خلاصه شناخت: {sanitize_telegram_html(profile.persona_summary)}"
         )
         await message.answer(text)
+
+    async def cmd_file(self, message: types.Message) -> None:
+        """نمایش لقب و سابقه انضباطی کاربر یا شخص ریپلای‌شده."""
+        if not message.from_user:
+            return
+        target = (
+            message.reply_to_message.from_user
+            if (message.reply_to_message and message.reply_to_message.from_user)
+            else message.from_user
+        )
+        user_file = await self.human.get_user_file(target.id)
+        target_name = sanitize_telegram_html(target.full_name)
+        if not user_file:
+            await message.answer(f"پرونده <b>{target_name}</b> فعلاً سفیده؛ هنوز سوتی خاصی نداده!")
+            return
+        nick, note = user_file
+        note_str = f"\n• سابقه: {sanitize_telegram_html(note)}" if note else ""
+        await message.answer(
+            f"📋 <b>پرونده انضباطی {target_name}</b>\n"
+            f"• لقب پیش آقای دانشور: «<b>{sanitize_telegram_html(nick)}</b>»{note_str}"
+        )
+
+    async def cmd_add_lore(self, message: types.Message) -> None:
+        """ثبت خاطره یا تکیه‌کلام واقعی مدرسه توسط ادمین."""
+        if not message.from_user or not self._is_admin(message.from_user.id):
+            await message.answer("این دستور فقط دست خودم و ادمین‌هاست بچه!")
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "بعد از دستور، متن خاطره رو بنویس. مثال:\n"
+                "<code>/add_lore پارسال سر صف صبحگاه میکروفون قطع شد</code>"
+            )
+            return
+        lore_id = await self.human.add_lore(parts[1].strip(), message.from_user.id)
+        await message.answer(f"حله! خاطره شماره <b>{lore_id}</b> رفت تو حافظه‌م، سرِ بزنگاه به روشون میارم.")
+
+    async def cmd_list_lore(self, message: types.Message) -> None:
+        """نمایش لیست خاطرات ثبت‌شده."""
+        if not message.from_user or not self._is_admin(message.from_user.id):
+            return
+        items = await self.human.list_all_lores()
+        if not items:
+            await message.answer("هنوز خاطره‌ای ثبت نکردی. با /add_lore اضافه کن.")
+            return
+        lines = [f"<b>{lid}.</b> {sanitize_telegram_html(txt)}" for lid, txt in items]
+        await message.answer("📚 <b>لیست خاطره‌های ثبت‌شده:</b>\n\n" + "\n".join(lines))
+
+    async def cmd_del_lore(self, message: types.Message) -> None:
+        """حذف یک خاطره با شماره ID."""
+        if not message.from_user or not self._is_admin(message.from_user.id):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await message.answer("شماره خاطره رو بنویس. مثال: <code>/del_lore 2</code>")
+            return
+        ok = await self.human.delete_lore(int(parts[1].strip()))
+        await message.answer("پاک شد رفت پی کارش." if ok else "همچین شماره‌ای پیدا نکردم.")
+
+    async def cmd_set_nick(self, message: types.Message) -> None:
+        """ثبت لقب اختصاصی با ریپلای روی پیام کاربر."""
+        if not message.from_user or not self._is_admin(message.from_user.id):
+            await message.answer("فقط ادمین می‌تونه لقب ثبت کنه!")
+            return
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.answer("روی پیام کسی که می‌خوای بهش لقب بدی ریپلای کن و بنویس:\n<code>/set_nick سلطان بهانه</code>")
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer("لقب رو جلوی دستور بنویس. مثال: <code>/set_nick کاپیتان قلابی</code>")
+            return
+        target = message.reply_to_message.from_user
+        nick = parts[1].strip()
+        await self.human.set_user_nickname(target.id, nick, "ثبت‌شده توسط مدیر گروه")
+        await message.answer(
+            f"تمام! از این به بعد تو پرونده <b>{sanitize_telegram_html(target.full_name)}</b> به اسم «<b>{sanitize_telegram_html(nick)}</b>» شناخته می‌شه."
+        )
 
     async def cmd_forgetme(self, message: types.Message) -> None:
         if not message.from_user:
@@ -246,6 +345,9 @@ class SocialHandlers:
             sender_name=message.from_user.full_name,
             current_message=topic_text,
             blocked_phrases=self.personality.get_blocked_signatures(),
+            tehran_time_context=self.human.get_tehran_time_context(),
+            user_file=await self.human.get_user_file(message.from_user.id),
+            custom_lore=await self.human.get_random_lores(limit=2),
         )
         raw_reply = await self.ai.generate_text(
             system_instruction=sys_inst,
@@ -281,7 +383,7 @@ class SocialHandlers:
         if not is_fresh:
             return
 
-        # ۱. ثبت در حافظه سه‌لایه
+        # ۱. ثبت در حافظه سه‌لایه و آپدیت پرونده انضباطی/لقب
         reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
         profile = await self.memory.process_incoming_message(
             chat_id=chat_id,
@@ -293,6 +395,7 @@ class SocialHandlers:
             text=text,
             reply_to_id=reply_to_id,
         )
+        await self.human.auto_update_disciplinary_file(user_id, text)
 
         # ۲. بازیابی بافت گروه و تشخیص رویدادها (در گروه)
         rep_text = message.reply_to_message.text if message.reply_to_message else None
@@ -310,6 +413,13 @@ class SocialHandlers:
             reply_to_text=rep_text,
             reply_to_sender=rep_sender,
         )
+
+        is_reply_to_bot = bool(
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == bot.id
+        )
+        is_mentioned = f"@{self.settings.BOT_USERNAME}" in text.lower()
 
         if not is_pv:
             event = await self.detector.inspect_message(
@@ -331,17 +441,16 @@ class SocialHandlers:
             if event.discipline_delta != 0:
                 await self.db.adjust_discipline_score(user_id, event.discipline_delta)
 
-            # واکنش ایموجی کنترل‌شده (با احتمال پایین و بدون مزاحمت)
-            if event.suggested_reaction and random.random() < 0.25:
+            # ری‌اکشن هوشمند انسانی (شامل 🖕 هنگام بی‌احترامی و ری‌اکشن‌های متنی در گروه)
+            reacted = await self.human.maybe_react(
+                message,
+                is_reply_to_bot=(is_reply_to_bot or is_mentioned),
+                probability=0.45,
+            )
+            if not reacted and event.suggested_reaction and random.random() < 0.25:
                 await self._try_react(message, event.suggested_reaction)
 
         # ۳. تصمیم‌گیری درباره پاسخ‌گویی با TriggerEngine
-        is_reply_to_bot = bool(
-            message.reply_to_message
-            and message.reply_to_message.from_user
-            and message.reply_to_message.from_user.id == bot.id
-        )
-        is_mentioned = f"@{self.settings.BOT_USERNAME}" in text.lower()
         sec_since_last = await self.limiter.seconds_since_last_reply(chat_id)
 
         # خواندن احتمال پویای تنظیم‌شده توسط ادمین (در صورت وجود)
@@ -390,6 +499,9 @@ class SocialHandlers:
             blocked_phrases=blocked_phrases,
             is_serious_distress=is_distress,
             is_bot_identity_query=is_bot_q,
+            tehran_time_context=self.human.get_tehran_time_context(),
+            user_file=await self.human.get_user_file(user_id),
+            custom_lore=await self.human.get_random_lores(limit=3),
         )
 
         # استفاده از Cache فقط برای احوالپرسی‌های ساده بدون وابستگی به پروفایل
