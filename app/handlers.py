@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class SocialHandlers:
-    """مدیریت پیام‌های گروهی و خصوصی بدون محدودیت سقف پاسخ و با سیستم قهر و آشتی."""
+    """مدیریت پیام‌های گروهی و خصوصی با ضدتکرار هوشمند، استدلال عمیق و قهر و آشتی."""
 
     NAME_TRIGGERS = ("دانشور", "دانوش", "معاون", "استاد")
     APOLOGY_WORDS = ("ببخشید", "شرمنده", "غلط کردم", "معذرت", "حلال کن", "شوخی کردم", "ناراحت نشو")
@@ -51,7 +51,6 @@ class SocialHandlers:
         self.human = human_features
         self.router = Router(name="social_router")
 
-        # تایمر ۱۵ دقیقه‌ای قهر و سرسنگین بودن با کاربر (user_id -> timestamp پایان قهر)
         self._grudge_until: dict[int, float] = {}
         self._bot_username_cache: Optional[str] = None
 
@@ -60,7 +59,6 @@ class SocialHandlers:
     def _register_routes(self) -> None:
         self.router.my_chat_member.register(self.on_bot_added_to_group)
 
-        # دستورات عمومی و حریم خصوصی
         self.router.message.register(self.cmd_start, CommandStart())
         self.router.message.register(self.cmd_about, Command("about"))
         self.router.message.register(self.cmd_privacy, Command("privacy"))
@@ -70,7 +68,6 @@ class SocialHandlers:
         self.router.message.register(self.cmd_optin, Command("optin"))
         self.router.message.register(self.cmd_judge, Command("judge"))
 
-        # دستورات پرونده انضباطی، لقب و خاطرات واقعی مدرسه
         self.router.message.register(self.cmd_file, Command("file"))
         self.router.message.register(self.cmd_add_lore, Command("add_lore"))
         self.router.message.register(self.cmd_list_lore, Command("list_lore"))
@@ -78,8 +75,6 @@ class SocialHandlers:
         self.router.message.register(self.cmd_set_nick, Command("set_nick"))
 
         self.router.callback_query.register(self.cb_confirm_forgetme, F.data.startswith("forgetme:"))
-
-        # پردازش تمام پیام‌های متنی عادی
         self.router.message.register(self.on_text_message, F.text)
 
     def _is_admin(self, user_id: Optional[int]) -> bool:
@@ -124,7 +119,7 @@ class SocialHandlers:
             return
 
         intro = (
-            "بههه! درود بر همه دانش‌آموزان عزیز! آقای دانشور هستم؛ معاون سابق و معلم آمادگی دفاعی شما.\n\n"
+            "درود بر همه بچه‌های گروه! آقای دانشور هستم؛ معاون سابق و معلم آمادگی دفاعی شما.\n\n"
             "📌 <b>شفافیت و حریم خصوصی:</b> بنده برای اینکه جمع‌مون باصفاتر باشه، علایق عمومی و شوخی‌های "
             "مجاز گروه رو به خاطر می‌سپرم (هیچ اطلاعات حساس یا پیام خصوصی ذخیره نمیشه). "
             "هر زمان خواستید با دستور /privacy جزئیات رو ببینید یا با /optout از پروفایل‌سازی خارج بشید."
@@ -140,7 +135,7 @@ class SocialHandlers:
         name = sanitize_telegram_html(message.from_user.full_name)
         today = get_jalali_date_str(self.settings.TIMEZONE)
         await message.answer(
-            f"بههه! آقای {name}! چه عجب پیدات شد! امروز {today} هست.\n"
+            f"سلام {name} جان! امروز {today} هست.\n"
             "برای آشنایی با قوانین و دستورات /about و /privacy رو بزن."
         )
 
@@ -327,7 +322,7 @@ class SocialHandlers:
             message.from_user.id, message.from_user.full_name, message.from_user.username
         )
         await self.db.set_user_opt_out(message.from_user.id, False)
-        await message.answer("بههه! خوش برگشتید به جمع! پروفایل‌سازی دوستانه برای شما دوباره فعال شد.")
+        await message.answer("خوش برگشتید به جمع! پروفایل‌سازی دوستانه برای شما دوباره فعال شد.")
 
     async def cmd_judge(self, message: types.Message, bot: Bot) -> None:
         if not message.from_user or not await self._is_group_allowed(message.chat, bot):
@@ -358,6 +353,7 @@ class SocialHandlers:
             tehran_time_context=self.human.get_tehran_time_context(),
             user_file=await self.human.get_user_file(message.from_user.id),
             custom_lore=await self.human.get_random_lores(limit=2),
+            recent_bot_replies=self.personality.get_recent_replies(),
         )
         raw_reply = await self.ai.generate_text(
             system_instruction=sys_inst,
@@ -371,7 +367,7 @@ class SocialHandlers:
         await self._send_safe_reply(message, f"⚖️ <b>حکم آقای دانشور:</b>\n{safe_reply}")
 
     async def on_text_message(self, message: types.Message, bot: Bot) -> None:
-        """خط اصلی پردازش پیام‌های متنی گروه و خصوصی (بدون محدودیت سقف پیام)."""
+        """خط اصلی پردازش پیام‌های متنی گروه و خصوصی با استدلال عمیق و ضدتکرار."""
         if not message.from_user or message.from_user.is_bot or not message.text:
             return
         if not await self._is_group_allowed(message.chat, bot):
@@ -388,7 +384,6 @@ class SocialHandlers:
         lower_text = text.lower()
         is_pv = message.chat.type == "private"
 
-        # جلوگیری از پردازش تکراریِ یک پیام واحد
         is_fresh = await self.limiter.register_human_message(chat_id, user_id, message.message_id, text)
         if not is_fresh:
             return
@@ -462,7 +457,6 @@ class SocialHandlers:
             except Exception as exc:
                 logger.warning(f"EventDetector non-fatal error in group {chat_id}: {exc}")
 
-            # ری‌اکشن هوشمند انسانی (شامل 🖕 هنگام بی‌احترامی)
             await self.human.maybe_react(
                 message,
                 is_reply_to_bot=(is_reply_to_bot or is_mentioned or is_name_called),
@@ -520,6 +514,7 @@ class SocialHandlers:
             tehran_time_context=self.human.get_tehran_time_context(),
             user_file=await self.human.get_user_file(user_id),
             custom_lore=await self.human.get_random_lores(limit=3),
+            recent_bot_replies=self.personality.get_recent_replies(),
         )
         if is_grudging and not is_distress:
             sys_inst += "\n[وضعیت روحی]: این کاربر چند دقیقه پیش به تو بی‌احترامی کرده و هنوز عذرخواهی نکرده؛ باهاش سرسنگین و تیکه‌پرون باش!"
@@ -532,10 +527,12 @@ class SocialHandlers:
         priority = 1 if decision.is_definite else 2
         fallback_text = self.personality.get_fallback(mode.key, is_serious_distress=is_distress)
 
+        # کش را خاموش می‌کنیم تا هر بار با توجه به گفتگو جواب جدید و منطقی تولید کند
         raw_reply = await self.ai.generate_text(
             system_instruction=sys_inst,
             prompt=prompt,
             priority=priority,
+            use_cache=False,
             fallback_pool=self.personality.FALLBACK_RESPONSES.get(mode.key),
         )
 
